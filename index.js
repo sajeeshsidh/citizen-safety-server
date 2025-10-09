@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const WebSocket = require('ws');
+const sqlite3 = require('sqlite3').verbose();
+const { open } = require('sqlite');
 
 const app = express();
 const server = http.createServer(app);
@@ -9,24 +11,54 @@ const wss = new WebSocket.Server({ server });
 
 const PORT = 3001;
 
-// In-memory "database"
-let citizens = [];
-let police = [];
+// --- Database Setup ---
+let db;
+
+async function setupDatabase() {
+    db = await open({
+        filename: './database.db',
+        driver: sqlite3.Database
+    });
+
+    await db.exec(`
+        CREATE TABLE IF NOT EXISTS citizens (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS police (
+            badgeNumber TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            designation TEXT NOT NULL,
+            phoneNumber TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            citizenId TEXT NOT NULL,
+            message TEXT,
+            audioBase64 TEXT,
+            locationLat REAL,
+            locationLng REAL,
+            timestamp INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            acceptedBy TEXT
+        );
+    `);
+    console.log('Database connected and tables ensured.');
+}
+
+
+// In-memory store for real-time, non-persistent data like officer locations
 const officerLocations = {
     '728': { lat: 34.06, lng: -118.25 },
     '551': { lat: 34.045, lng: -118.26 },
     '912': { lat: 34.055, lng: -118.23 },
 };
-let alerts = [];
-let nextAlertId = 1;
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // --- WebSocket Logic ---
 const clients = new Set();
-
-const getSortedAlerts = () => [...alerts].sort((a, b) => b.timestamp - a.timestamp);
 
 const broadcastData = (data) => {
     const dataString = JSON.stringify(data);
@@ -42,8 +74,24 @@ const broadcastData = (data) => {
     });
 };
 
-const broadcastAlerts = () => {
-    broadcastData({ type: 'alerts', payload: getSortedAlerts() });
+const formatAlerts = (alerts) => {
+    return alerts.map(alert => {
+        const { locationLat, locationLng, ...rest } = alert;
+        const newAlert = { ...rest };
+        if (locationLat != null && locationLng != null) {
+            newAlert.location = { lat: locationLat, lng: locationLng };
+        }
+        return newAlert;
+    });
+};
+
+const broadcastAlerts = async () => {
+    try {
+        const alerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
+        broadcastData({ type: 'alerts', payload: formatAlerts(alerts) });
+    } catch (error) {
+        console.error("Failed to fetch and broadcast alerts:", error);
+    }
 };
 
 const broadcastLocations = () => {
@@ -57,12 +105,18 @@ const broadcastLocations = () => {
 // Periodically broadcast locations to all clients
 setInterval(broadcastLocations, 2000);
 
-wss.on('connection', (ws) => {
+wss.on('connection', async (ws) => {
   clients.add(ws);
   console.log('Client connected. Total clients:', clients.size);
 
   // Send the current list of alerts and locations to the newly connected client
-  ws.send(JSON.stringify({ type: 'alerts', payload: getSortedAlerts() }));
+  try {
+      const alerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
+      ws.send(JSON.stringify({ type: 'alerts', payload: formatAlerts(alerts) }));
+  } catch (error) {
+      console.error("Failed to send initial alerts to new client:", error);
+  }
+  
   broadcastLocations(); // Send latest locations immediately on connect
 
   ws.on('close', () => {
@@ -75,11 +129,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-
-// --- Helper Functions ---
-const findCitizen = (username) => citizens.find(c => c.username === username);
-const findPoliceByBadge = (badgeNumber) => police.find(p => p.badgeNumber === badgeNumber);
-
 // --- Routes ---
 
 app.get('/', (req, res) => {
@@ -87,54 +136,83 @@ app.get('/', (req, res) => {
 });
 
 // Citizen Registration
-app.post('/api/citizen/register', (req, res) => {
+app.post('/api/citizen/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ message: 'Username and password are required.' });
-  if (findCitizen(username)) return res.status(409).json({ message: 'Username already taken.' });
   
-  const newUser = { username, password };
-  citizens.push(newUser);
-  console.log('New citizen registered:', newUser.username);
-  res.status(201).json({ username: newUser.username });
+  try {
+      const existingUser = await db.get('SELECT * FROM citizens WHERE username = ?', [username]);
+      if (existingUser) {
+          return res.status(409).json({ message: 'Username already taken.' });
+      }
+      await db.run('INSERT INTO citizens (username, password) VALUES (?, ?)', [username, password]);
+      console.log('New citizen registered:', username);
+      res.status(201).json({ username });
+  } catch (err) {
+      console.error('Registration error:', err);
+      res.status(500).json({ message: 'Server error during registration.' });
+  }
 });
 
 // Citizen Login
-app.post('/api/citizen/login', (req, res) => {
+app.post('/api/citizen/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ message: 'Username and password are required.' });
   
-  const user = findCitizen(username);
-  if (!user || user.password !== password) return res.status(401).json({ message: 'Invalid username or password.' });
-  
-  console.log('Citizen logged in:', user.username);
-  res.status(200).json({ username: user.username });
+  try {
+      const user = await db.get('SELECT * FROM citizens WHERE username = ?', [username]);
+      if (!user || user.password !== password) {
+          return res.status(401).json({ message: 'Invalid username or password.' });
+      }
+      console.log('Citizen logged in:', user.username);
+      res.status(200).json({ username: user.username });
+  } catch (err) {
+      console.error('Login error:', err);
+      res.status(500).json({ message: 'Server error during login.' });
+  }
 });
 
 // Police Registration
-app.post('/api/police/register', (req, res) => {
+app.post('/api/police/register', async (req, res) => {
     const { name, designation, badgeNumber, phoneNumber } = req.body;
     if (!name || !designation || !badgeNumber || !phoneNumber) return res.status(400).json({ message: 'All fields are required.' });
-    if (findPoliceByBadge(badgeNumber)) return res.status(409).json({ message: 'Badge number already registered.' });
 
-    const newOfficer = { name, designation, badgeNumber, phoneNumber };
-    police.push(newOfficer);
-    console.log('New officer registered:', newOfficer.badgeNumber);
-    res.status(201).json(newOfficer);
+    try {
+        const existingOfficer = await db.get('SELECT * FROM police WHERE badgeNumber = ?', [badgeNumber]);
+        if (existingOfficer) {
+            return res.status(409).json({ message: 'Badge number already registered.' });
+        }
+        await db.run(
+            'INSERT INTO police (name, designation, badgeNumber, phoneNumber) VALUES (?, ?, ?, ?)',
+            [name, designation, badgeNumber, phoneNumber]
+        );
+        const newOfficer = { name, designation, badgeNumber, phoneNumber };
+        console.log('New officer registered:', newOfficer.badgeNumber);
+        res.status(201).json(newOfficer);
+    } catch (err) {
+        console.error('Police registration error:', err);
+        res.status(500).json({ message: 'Server error during registration.' });
+    }
 });
 
 // Police Login
-app.post('/api/police/login', (req, res) => {
+app.post('/api/police/login', async (req, res) => {
     const { badgeNumber } = req.body;
     if (!badgeNumber) return res.status(400).json({ message: 'Badge number is required.' });
 
-    const officer = findPoliceByBadge(badgeNumber);
-    if (!officer) return res.status(404).json({ message: 'Badge number not found.' });
-    
-    if (!officerLocations[officer.badgeNumber]) {
-        officerLocations[officer.badgeNumber] = { lat: 34.0522, lng: -118.2437 };
+    try {
+        const officer = await db.get('SELECT * FROM police WHERE badgeNumber = ?', [badgeNumber]);
+        if (!officer) return res.status(404).json({ message: 'Badge number not found.' });
+        
+        if (!officerLocations[officer.badgeNumber]) {
+            officerLocations[officer.badgeNumber] = { lat: 34.0522, lng: -118.2437 }; // Default location
+        }
+        console.log('Officer logged in:', officer.badgeNumber);
+        res.status(200).json(officer);
+    } catch (err) {
+        console.error('Police login error:', err);
+        res.status(500).json({ message: 'Server error during login.' });
     }
-    console.log('Officer logged in:', officer.badgeNumber);
-    res.status(200).json(officer);
 });
 
 // POST to update an officer's location
@@ -143,7 +221,6 @@ app.post('/api/police/location', (req, res) => {
     if (!badgeNumber || !location) return res.status(400).json({ message: 'Badge number and location are required.' });
     
     officerLocations[badgeNumber] = location;
-    // Don't wait for the interval, broadcast the update immediately for responsiveness
     broadcastLocations(); 
     res.status(204).send();
 });
@@ -159,121 +236,140 @@ app.get('/api/police/locations', (req, res) => {
 
 // --- Alert Routes ---
 
-// GET all alerts (still useful for citizens or initial load)
-app.get('/api/alerts', (req, res) => {
-  res.status(200).json(getSortedAlerts());
+// GET all alerts
+app.get('/api/alerts', async (req, res) => {
+    try {
+        const alerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
+        res.status(200).json(formatAlerts(alerts));
+    } catch (err) {
+        console.error("Error fetching alerts:", err);
+        res.status(500).json({ message: 'Failed to fetch alerts.' });
+    }
 });
 
 // POST a new alert
-app.post('/api/alerts', (req, res) => {
+app.post('/api/alerts', async (req, res) => {
   const { citizenId, message, audioBase64, location } = req.body;
   if (!citizenId) return res.status(400).json({ message: 'Citizen ID is required.' });
 
-  const newAlert = {
-    id: (nextAlertId++).toString(),
-    citizenId,
-    message,
-    audioBase64,
-    location,
-    timestamp: Date.now(),
-    status: 'new',
-  };
-  alerts.push(newAlert);
-  console.log('New alert created:', newAlert.id);
-  
-  broadcastAlerts(); // Broadcast the update
-  
-  res.status(201).json(newAlert);
+  try {
+      const result = await db.run(
+          'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [citizenId, message || null, audioBase64 || null, location?.lat || null, location?.lng || null, Date.now(), 'new']
+      );
+      
+      const newAlert = {
+          id: result.lastID,
+          citizenId,
+          message,
+          audioBase64,
+          location,
+          timestamp: Date.now(),
+          status: 'new'
+      };
+      console.log('New alert created:', newAlert.id);
+      broadcastAlerts();
+      res.status(201).json(newAlert);
+  } catch (err) {
+      console.error("Error creating alert:", err);
+      res.status(500).json({ message: 'Failed to create alert.' });
+  }
 });
 
 // POST to accept an alert
-app.post('/api/alerts/:id/accept', (req, res) => {
+app.post('/api/alerts/:id/accept', async (req, res) => {
     const { id } = req.params;
     const { officerId } = req.body;
     if (!officerId) return res.status(400).json({ message: 'Officer ID is required.' });
 
-    const alert = alerts.find(a => a.id === id);
-    if (!alert) return res.status(404).json({ message: 'Alert not found.' });
-    if (alert.status !== 'new') return res.status(409).json({ message: 'Alert has already been accepted.' });
+    try {
+        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [id]);
+        if (!alert) return res.status(404).json({ message: 'Alert not found.' });
 
-    alert.status = 'accepted';
-    alert.acceptedBy = officerId;
-    console.log(`Alert ${id} accepted by officer ${officerId}`);
-
-    broadcastAlerts(); // Broadcast the update
-
-    res.status(200).json(alert);
+        if (alert.status !== 'new') {
+            return res.status(409).json({ message: 'Alert has already been accepted or does not exist.' });
+        }
+        
+        await db.run('UPDATE alerts SET status = ?, acceptedBy = ? WHERE id = ?', ['accepted', officerId, id]);
+        
+        console.log(`Alert ${id} accepted by officer ${officerId}`);
+        broadcastAlerts();
+        res.status(200).json({ message: 'Alert accepted' });
+    } catch (err) {
+        console.error(`Error accepting alert ${id}:`, err);
+        res.status(500).json({ message: 'Server error while accepting alert.' });
+    }
 });
 
 // POST to resolve an alert
-app.post('/api/alerts/:id/resolve', (req, res) => {
+app.post('/api/alerts/:id/resolve', async (req, res) => {
     const { id } = req.params;
-    const alert = alerts.find(a => a.id === id);
-    if (!alert) return res.status(404).json({ message: 'Alert not found.' });
-    if (alert.status !== 'accepted') return res.status(409).json({ message: 'Alert must be accepted to be resolved.' });
+    
+    try {
+        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [id]);
+        if (!alert) return res.status(404).json({ message: 'Alert not found.' });
+        
+        if (alert.status !== 'accepted') {
+            return res.status(409).json({ message: 'Alert must be accepted to be resolved.' });
+        }
+        
+        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['resolved', id]);
 
-    alert.status = 'resolved';
-    console.log(`Alert ${id} resolved.`);
-
-    broadcastAlerts(); // Broadcast the update
-
-    res.status(200).json(alert);
+        console.log(`Alert ${id} resolved.`);
+        broadcastAlerts();
+        res.status(200).json({ message: 'Alert resolved' });
+    } catch (err) {
+        console.error(`Error resolving alert ${id}:`, err);
+        res.status(500).json({ message: 'Server error while resolving alert.' });
+    }
 });
 
 // POST to cancel an alert
-app.post('/api/alerts/:id/cancel', (req, res) => {
+app.post('/api/alerts/:id/cancel', async (req, res) => {
     const { id } = req.params;
-    const alert = alerts.find(a => a.id === id);
-    if (!alert) return res.status(404).json({ message: 'Alert not found.' });
-    if (alert.status === 'resolved' || alert.status === 'canceled') {
-        return res.status(409).json({ message: `Alert has already been ${alert.status}.` });
+    
+    try {
+        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [id]);
+        if (!alert) return res.status(404).json({ message: 'Alert not found.' });
+        
+        if (alert.status !== 'new' && alert.status !== 'accepted') {
+            return res.status(409).json({ message: `Alert could not be canceled (it might already be resolved).` });
+        }
+        
+        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['canceled', id]);
+
+        console.log(`Alert ${id} canceled by citizen.`);
+        broadcastAlerts();
+        res.status(200).json({ message: 'Alert canceled' });
+    } catch (err) {
+        console.error(`Error canceling alert ${id}:`, err);
+        res.status(500).json({ message: 'Server error while canceling alert.' });
     }
-
-    alert.status = 'canceled';
-    console.log(`Alert ${id} canceled by citizen.`);
-
-    broadcastAlerts(); // Broadcast the update
-
-    res.status(200).json(alert);
 });
 
 // DELETE a single alert
-app.delete('/api/alerts/:id', (req, res) => {
+app.delete('/api/alerts/:id', async (req, res) => {
     const { id } = req.params;
-    const alertIndex = alerts.findIndex(a => a.id === id);
-    if (alertIndex === -1) {
-        return res.status(404).json({ message: 'Alert not found.' });
+    try {
+        const result = await db.run('DELETE FROM alerts WHERE id = ?', [id]);
+        if (result.changes === 0) {
+            return res.status(404).json({ message: 'Alert not found.' });
+        }
+        console.log(`Alert ${id} deleted.`);
+        broadcastAlerts();
+        res.status(204).send();
+    } catch (err) {
+        console.error(`Error deleting alert ${id}:`, err);
+        res.status(500).json({ message: 'Server error while deleting alert.' });
     }
-
-    alerts.splice(alertIndex, 1);
-    console.log(`Alert ${id} deleted.`);
-
-    broadcastAlerts(); // Broadcast the update
-    res.status(204).send(); // No Content
 });
 
-// DELETE multiple alerts based on scope
-app.delete('/api/alerts', (req, res) => {
-    const { scope, citizenId } = req.query;
-
-    if (scope === 'resolved') {
-        const originalLength = alerts.length;
-        alerts = alerts.filter(a => a.status !== 'resolved');
-        const numDeleted = originalLength - alerts.length;
-        console.log(`Cleared ${numDeleted} resolved alerts.`);
-    } else if (citizenId) {
-        const originalLength = alerts.length;
-        alerts = alerts.filter(a => a.citizenId !== citizenId);
-        const numDeleted = originalLength - alerts.length;
-        console.log(`Cleared ${numDeleted} alerts for citizen ${citizenId}.`);
-    } else {
-        return res.status(400).json({ message: 'A valid scope (resolved) or citizenId is required.' });
-    }
-
-    broadcastAlerts();
-    res.status(204).send();
-});
-
-server.listen(PORT, () => {
-  console.log(`Server with WebSocket is running on http://localhost:${PORT}`);
+// --- Server Startup ---
+setupDatabase().then(() => {
+    server.listen(PORT, () => {
+        console.log(`Server with WebSocket is running on http://localhost:${PORT}`);
+    });
+}).catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
 });
