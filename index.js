@@ -20,6 +20,8 @@ async function setupDatabase() {
         driver: sqlite3.Database
     });
 
+    // The CREATE TABLE statement is kept with all columns for new database setups.
+    // The migration logic below will handle existing databases.
     await db.exec(`
         CREATE TABLE IF NOT EXISTS citizens (
             username TEXT PRIMARY KEY,
@@ -40,19 +42,47 @@ async function setupDatabase() {
             locationLng REAL,
             timestamp INTEGER NOT NULL,
             status TEXT NOT NULL,
-            acceptedBy TEXT
+            acceptedBy TEXT,
+            searchRadius INTEGER,
+            timeoutTimestamp INTEGER
         );
     `);
+
+    // --- Simple Migration: Add missing columns if they don't exist ---
+    // This makes the app resilient to schema changes on existing databases.
+    const alertsInfo = await db.all("PRAGMA table_info(alerts)");
+    const columnNames = alertsInfo.map(col => col.name);
+
+    if (!columnNames.includes('locationLat')) {
+        console.log('Migrating database: Adding locationLat column to alerts table.');
+        await db.exec('ALTER TABLE alerts ADD COLUMN locationLat REAL');
+    }
+    if (!columnNames.includes('locationLng')) {
+        console.log('Migrating database: Adding locationLng column to alerts table.');
+        await db.exec('ALTER TABLE alerts ADD COLUMN locationLng REAL');
+    }
+    if (!columnNames.includes('searchRadius')) {
+        console.log('Migrating database: Adding searchRadius column to alerts table.');
+        await db.exec('ALTER TABLE alerts ADD COLUMN searchRadius INTEGER');
+    }
+
+    if (!columnNames.includes('timeoutTimestamp')) {
+        console.log('Migrating database: Adding timeoutTimestamp column to alerts table.');
+        await db.exec('ALTER TABLE alerts ADD COLUMN timeoutTimestamp INTEGER');
+    }
+
     console.log('Database connected and tables ensured.');
 }
 
 
-// In-memory store for real-time, non-persistent data like officer locations
+// In-memory store for real-time, non-persistent data
 const officerLocations = {
     '728': { lat: 34.06, lng: -118.25 },
     '551': { lat: 34.045, lng: -118.26 },
     '912': { lat: 34.055, lng: -118.23 },
 };
+const alertTimers = new Map();
+
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -128,6 +158,16 @@ wss.on('connection', async (ws) => {
     console.error('WebSocket error:', error);
   });
 });
+
+const clearAlertTimers = (alertId) => {
+    const timers = alertTimers.get(alertId);
+    if (timers) {
+        clearTimeout(timers.escalationTimer);
+        clearTimeout(timers.timeoutTimer);
+        alertTimers.delete(alertId);
+        console.log(`Cleared timers for alert ${alertId}`);
+    }
+};
 
 // --- Routes ---
 
@@ -253,20 +293,51 @@ app.post('/api/alerts', async (req, res) => {
   if (!citizenId) return res.status(400).json({ message: 'Citizen ID is required.' });
 
   try {
+      const timestamp = Date.now();
+      const TIMEOUT_DURATION = 60 * 1000;
+      const timeoutTimestamp = timestamp + TIMEOUT_DURATION;
+      const TIMEOUT_ESCALATE = 30 * 1000;
+
       const result = await db.run(
-          'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [citizenId, message || null, audioBase64 || null, location?.lat || null, location?.lng || null, Date.now(), 'new']
+          'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, searchRadius, timeoutTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [citizenId, message || null, audioBase64 || null, location?.lat || null, location?.lng || null, timestamp, 'new', 5, timeoutTimestamp]
       );
       
+      const newAlertId = result.lastID;
       const newAlert = {
-          id: result.lastID,
+          id: newAlertId,
           citizenId,
           message,
           audioBase64,
           location,
-          timestamp: Date.now(),
-          status: 'new'
+          timestamp,
+          status: 'new',
+          searchRadius: 5,
+          timeoutTimestamp: timeoutTimestamp
       };
+
+      // Set timers for escalation and timeout
+      const escalationTimer = setTimeout(async () => {
+        const currentAlert = await db.get('SELECT status FROM alerts WHERE id = ?', [newAlertId]);
+        if (currentAlert && currentAlert.status === 'new') {
+            console.log(`Escalating search for alert ${newAlertId}`);
+            await db.run('UPDATE alerts SET searchRadius = ? WHERE id = ?', [10, newAlertId]);
+            broadcastAlerts();
+        }
+      }, TIMEOUT_ESCALATE);
+
+      const timeoutTimer = setTimeout(async () => {
+        const currentAlert = await db.get('SELECT status FROM alerts WHERE id = ?', [newAlertId]);
+        if (currentAlert && currentAlert.status === 'new') {
+            console.log(`Timing out alert ${newAlertId}`);
+            await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['timed_out', newAlertId]);
+            broadcastAlerts();
+        }
+        alertTimers.delete(newAlertId);
+      }, TIMEOUT_DURATION);
+      
+      alertTimers.set(newAlertId, { escalationTimer, timeoutTimer });
+
       console.log('New alert created:', newAlert.id);
       broadcastAlerts();
       res.status(201).json(newAlert);
@@ -278,88 +349,91 @@ app.post('/api/alerts', async (req, res) => {
 
 // POST to accept an alert
 app.post('/api/alerts/:id/accept', async (req, res) => {
-    const { id } = req.params;
+    const alertId = parseInt(req.params.id, 10);
     const { officerId } = req.body;
     if (!officerId) return res.status(400).json({ message: 'Officer ID is required.' });
 
     try {
-        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [id]);
+        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
         if (!alert) return res.status(404).json({ message: 'Alert not found.' });
 
         if (alert.status !== 'new') {
             return res.status(409).json({ message: 'Alert has already been accepted or does not exist.' });
         }
         
-        await db.run('UPDATE alerts SET status = ?, acceptedBy = ? WHERE id = ?', ['accepted', officerId, id]);
+        await db.run('UPDATE alerts SET status = ?, acceptedBy = ? WHERE id = ?', ['accepted', officerId, alertId]);
+        clearAlertTimers(alertId);
         
-        console.log(`Alert ${id} accepted by officer ${officerId}`);
+        console.log(`Alert ${alertId} accepted by officer ${officerId}`);
         broadcastAlerts();
         res.status(200).json({ message: 'Alert accepted' });
     } catch (err) {
-        console.error(`Error accepting alert ${id}:`, err);
+        console.error(`Error accepting alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while accepting alert.' });
     }
 });
 
 // POST to resolve an alert
 app.post('/api/alerts/:id/resolve', async (req, res) => {
-    const { id } = req.params;
+    const alertId = parseInt(req.params.id, 10);
     
     try {
-        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [id]);
+        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
         if (!alert) return res.status(404).json({ message: 'Alert not found.' });
         
         if (alert.status !== 'accepted') {
             return res.status(409).json({ message: 'Alert must be accepted to be resolved.' });
         }
         
-        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['resolved', id]);
+        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['resolved', alertId]);
 
-        console.log(`Alert ${id} resolved.`);
+        console.log(`Alert ${alertId} resolved.`);
         broadcastAlerts();
         res.status(200).json({ message: 'Alert resolved' });
     } catch (err) {
-        console.error(`Error resolving alert ${id}:`, err);
+        console.error(`Error resolving alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while resolving alert.' });
     }
 });
 
 // POST to cancel an alert
 app.post('/api/alerts/:id/cancel', async (req, res) => {
-    const { id } = req.params;
+    const alertId = parseInt(req.params.id, 10);
     
     try {
-        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [id]);
+        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
         if (!alert) return res.status(404).json({ message: 'Alert not found.' });
         
         if (alert.status !== 'new' && alert.status !== 'accepted') {
             return res.status(409).json({ message: `Alert could not be canceled (it might already be resolved).` });
         }
         
-        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['canceled', id]);
+        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['canceled', alertId]);
+        clearAlertTimers(alertId);
 
-        console.log(`Alert ${id} canceled by citizen.`);
+        console.log(`Alert ${alertId} canceled by citizen.`);
         broadcastAlerts();
         res.status(200).json({ message: 'Alert canceled' });
     } catch (err) {
-        console.error(`Error canceling alert ${id}:`, err);
+        console.error(`Error canceling alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while canceling alert.' });
     }
 });
 
 // DELETE a single alert
 app.delete('/api/alerts/:id', async (req, res) => {
-    const { id } = req.params;
+    const alertId = parseInt(req.params.id, 10);
     try {
-        const result = await db.run('DELETE FROM alerts WHERE id = ?', [id]);
+        const result = await db.run('DELETE FROM alerts WHERE id = ?', [alertId]);
         if (result.changes === 0) {
             return res.status(404).json({ message: 'Alert not found.' });
         }
-        console.log(`Alert ${id} deleted.`);
+        clearAlertTimers(alertId);
+        console.log(`Alert ${alertId} deleted.`);
         broadcastAlerts();
         res.status(204).send();
     } catch (err) {
-        console.error(`Error deleting alert ${id}:`, err);
+        console.error(`Error deleting alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while deleting alert.' });
     }
 });
