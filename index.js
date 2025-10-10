@@ -14,6 +14,37 @@ const PORT = 3001;
 // --- Database Setup ---
 let db;
 
+/**
+ * Calculates the distance between two lat/lng coordinates in kilometers.
+ * @param {{lat: number, lng: number}} coords1 - The first coordinate.
+ * @param {{lat: number, lng: number}} coords2 - The second coordinate.
+ * @returns {number} The distance in kilometers.
+ */
+function haversineDistance(coords1, coords2) {
+    function toRad(x) {
+        return x * Math.PI / 180;
+    }
+
+    const lat1 = coords1.lat;
+    const lon1 = coords1.lng;
+    const lat2 = coords2.lat;
+    const lon2 = coords2.lng;
+
+    const R = 6371; // Earth's radius in km
+
+    const x1 = lat2 - lat1;
+    const dLat = toRad(x1);
+    const x2 = lon2 - lon1;
+    const dLon = toRad(x2);
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    
+    return R * c;
+}
+
+
 async function setupDatabase() {
     db = await open({
         filename: './database.db',
@@ -44,7 +75,8 @@ async function setupDatabase() {
             status TEXT NOT NULL,
             acceptedBy TEXT,
             searchRadius INTEGER,
-            timeoutTimestamp INTEGER
+            timeoutTimestamp INTEGER,
+            targetedOfficers TEXT
         );
     `);
 
@@ -65,10 +97,13 @@ async function setupDatabase() {
         console.log('Migrating database: Adding searchRadius column to alerts table.');
         await db.exec('ALTER TABLE alerts ADD COLUMN searchRadius INTEGER');
     }
-
     if (!columnNames.includes('timeoutTimestamp')) {
         console.log('Migrating database: Adding timeoutTimestamp column to alerts table.');
         await db.exec('ALTER TABLE alerts ADD COLUMN timeoutTimestamp INTEGER');
+    }
+    if (!columnNames.includes('targetedOfficers')) {
+        console.log('Migrating database: Adding targetedOfficers column to alerts table.');
+        await db.exec('ALTER TABLE alerts ADD COLUMN targetedOfficers TEXT');
     }
 
     console.log('Database connected and tables ensured.');
@@ -89,27 +124,21 @@ app.use(express.json({ limit: '10mb' }));
 
 // --- WebSocket Logic ---
 const clients = new Set();
-
-const broadcastData = (data) => {
-    const dataString = JSON.stringify(data);
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(dataString, (err) => {
-                if (err) {
-                    console.error('WebSocket send error:', err);
-                    clients.delete(client);
-                }
-            });
-        }
-    });
-};
+const clientMetadata = new Map(); // Stores metadata for each client (e.g., role, badgeNumber)
 
 const formatAlerts = (alerts) => {
     return alerts.map(alert => {
-        const { locationLat, locationLng, ...rest } = alert;
+        const { locationLat, locationLng, targetedOfficers, ...rest } = alert;
         const newAlert = { ...rest };
         if (locationLat != null && locationLng != null) {
             newAlert.location = { lat: locationLat, lng: locationLng };
+        }
+        try {
+            // Safely parse the targetedOfficers JSON string
+            newAlert.targetedOfficers = targetedOfficers ? JSON.parse(targetedOfficers) : [];
+        } catch (e) {
+            console.error(`Error parsing targetedOfficers for alert ${alert.id}:`, e);
+            newAlert.targetedOfficers = [];
         }
         return newAlert;
     });
@@ -117,8 +146,37 @@ const formatAlerts = (alerts) => {
 
 const broadcastAlerts = async () => {
     try {
-        const alerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
-        broadcastData({ type: 'alerts', payload: formatAlerts(alerts) });
+        const allAlerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
+        const formattedAlerts = formatAlerts(allAlerts);
+
+        clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                const metadata = clientMetadata.get(client);
+
+                // Only send alerts to authenticated police officers. Citizens use polling.
+                if (metadata && metadata.role === 'police') {
+                    const badgeNumber = metadata.mobile;
+                    
+                    const policeVisibleAlerts = formattedAlerts.filter(alert => 
+                        // Active alerts: new ones targeted to them, or ones they've accepted
+                        (alert.status === 'new' && alert.targetedOfficers?.includes(badgeNumber)) ||
+                        (alert.status === 'accepted' && alert.acceptedBy === badgeNumber) ||
+                        // Historical alerts are visible to all officers
+                        alert.status === 'resolved' ||
+                        alert.status === 'canceled' ||
+                        alert.status === 'timed_out'
+                    );
+
+                    client.send(JSON.stringify({ type: 'alerts', payload: policeVisibleAlerts }), (err) => {
+                        if (err) {
+                            console.error('WebSocket send error:', err);
+                            clients.delete(client);
+                            clientMetadata.delete(client);
+                        }
+                    });
+                }
+            }
+        });
     } catch (error) {
         console.error("Failed to fetch and broadcast alerts:", error);
     }
@@ -129,33 +187,63 @@ const broadcastLocations = () => {
         badgeNumber,
         location,
     }));
-    broadcastData({ type: 'locations', payload: locationsArray });
+     const dataString = JSON.stringify({ type: 'locations', payload: locationsArray });
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(dataString);
+        }
+    });
 };
 
 // Periodically broadcast locations to all clients
 setInterval(broadcastLocations, 2000);
 
-wss.on('connection', async (ws) => {
+wss.on('connection', (ws) => {
   clients.add(ws);
   console.log('Client connected. Total clients:', clients.size);
 
-  // Send the current list of alerts and locations to the newly connected client
-  try {
-      const alerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
-      ws.send(JSON.stringify({ type: 'alerts', payload: formatAlerts(alerts) }));
-  } catch (error) {
-      console.error("Failed to send initial alerts to new client:", error);
-  }
-  
-  broadcastLocations(); // Send latest locations immediately on connect
+  // Send initial location data to the new client
+  broadcastLocations();
+
+  ws.on('message', async (message) => {
+      try {
+          const parsedMessage = JSON.parse(message);
+          if (parsedMessage.type === 'auth' && parsedMessage.payload) {
+              console.log(`Authenticating client for user:`, parsedMessage.payload);
+              clientMetadata.set(ws, parsedMessage.payload);
+
+              // Once authenticated, send the initial, filtered list of alerts.
+              if (parsedMessage.payload.role === 'police') {
+                  const badgeNumber = parsedMessage.payload.mobile;
+                  const allAlerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
+                  const formattedAlerts = formatAlerts(allAlerts);
+                  
+                  const policeVisibleAlerts = formattedAlerts.filter(alert => 
+                      (alert.status === 'new' && alert.targetedOfficers?.includes(badgeNumber)) ||
+                      (alert.status === 'accepted' && alert.acceptedBy === badgeNumber) ||
+                      alert.status === 'resolved' ||
+                      alert.status === 'canceled' ||
+                      alert.status === 'timed_out'
+                  );
+
+                  ws.send(JSON.stringify({ type: 'alerts', payload: policeVisibleAlerts }));
+              }
+          }
+      } catch (e) {
+          console.error('Failed to process message:', e);
+      }
+  });
 
   ws.on('close', () => {
     clients.delete(ws);
+    clientMetadata.delete(ws); // Clean up metadata
     console.log('Client disconnected. Total clients:', clients.size);
   });
 
   ws.on('error', (error) => {
     console.error('WebSocket error:', error);
+    clients.delete(ws);
+    clientMetadata.delete(ws);
   });
 });
 
@@ -297,10 +385,22 @@ app.post('/api/alerts', async (req, res) => {
       const TIMEOUT_DURATION = 60 * 1000;
       const timeoutTimestamp = timestamp + TIMEOUT_DURATION;
       const TIMEOUT_ESCALATE = 30 * 1000;
+      
+      // Perform initial 5km search for officers
+      let targetedOfficers = [];
+      if (location) {
+          targetedOfficers = Object.entries(officerLocations)
+              .filter(([badgeNumber, officerLocation]) => {
+                  const distance = haversineDistance(location, officerLocation);
+                  return distance <= 5; // Initial 5km radius
+              })
+              .map(([badgeNumber]) => badgeNumber);
+      }
+      console.log(`Alert created. Targeting ${targetedOfficers.length} officers within 5km.`);
 
       const result = await db.run(
-          'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, searchRadius, timeoutTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [citizenId, message || null, audioBase64 || null, location?.lat || null, location?.lng || null, timestamp, 'new', 5, timeoutTimestamp]
+          'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, searchRadius, timeoutTimestamp, targetedOfficers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [citizenId, message || null, audioBase64 || null, location?.lat || null, location?.lng || null, timestamp, 'new', 5, timeoutTimestamp, JSON.stringify(targetedOfficers)]
       );
       
       const newAlertId = result.lastID;
@@ -313,15 +413,29 @@ app.post('/api/alerts', async (req, res) => {
           timestamp,
           status: 'new',
           searchRadius: 5,
-          timeoutTimestamp: timeoutTimestamp
+          timeoutTimestamp: timeoutTimestamp,
+          targetedOfficers: targetedOfficers,
       };
 
       // Set timers for escalation and timeout
       const escalationTimer = setTimeout(async () => {
-        const currentAlert = await db.get('SELECT status FROM alerts WHERE id = ?', [newAlertId]);
+        const currentAlert = await db.get('SELECT status, locationLat, locationLng FROM alerts WHERE id = ?', [newAlertId]);
         if (currentAlert && currentAlert.status === 'new') {
             console.log(`Escalating search for alert ${newAlertId}`);
-            await db.run('UPDATE alerts SET searchRadius = ? WHERE id = ?', [10, newAlertId]);
+            
+            let escalatedTargetedOfficers = [];
+            if (currentAlert.locationLat && currentAlert.locationLng) {
+                const alertLocation = { lat: currentAlert.locationLat, lng: currentAlert.locationLng };
+                escalatedTargetedOfficers = Object.entries(officerLocations)
+                    .filter(([badgeNumber, officerLocation]) => {
+                        const distance = haversineDistance(alertLocation, officerLocation);
+                        return distance <= 10; // New 10km radius
+                    })
+                    .map(([badgeNumber]) => badgeNumber);
+            }
+            console.log(`Escalated search targeting ${escalatedTargetedOfficers.length} officers within 10km.`);
+
+            await db.run('UPDATE alerts SET searchRadius = ?, targetedOfficers = ? WHERE id = ?', [10, JSON.stringify(escalatedTargetedOfficers), newAlertId]);
             broadcastAlerts();
         }
       }, TIMEOUT_ESCALATE);
@@ -335,7 +449,7 @@ app.post('/api/alerts', async (req, res) => {
         }
         alertTimers.delete(newAlertId);
       }, TIMEOUT_DURATION);
-      
+
       alertTimers.set(newAlertId, { escalationTimer, timeoutTimer });
 
       console.log('New alert created:', newAlert.id);
