@@ -7,8 +7,11 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@react-native-community/geolocation": "^3.4.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "react-native-maps": "^1.26.14",
+    "react-native-svg": "^15.14.0",
     "sqlite": "^5.1.1",
     "sqlite3": "^5.1.7",
     "ws": "^8.17.1"

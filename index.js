@@ -152,29 +152,36 @@ const broadcastAlerts = async () => {
         clients.forEach(client => {
             if (client.readyState === WebSocket.OPEN) {
                 const metadata = clientMetadata.get(client);
+                if (!metadata) {
+                    return; // Skip unauthenticated clients
+                }
 
-                // Only send alerts to authenticated police officers. Citizens use polling.
-                if (metadata && metadata.role === 'police') {
+                let alertsToSend = [];
+                if (metadata.role === 'police') {
                     const badgeNumber = metadata.mobile;
                     
-                    const policeVisibleAlerts = formattedAlerts.filter(alert => 
+                    alertsToSend = formattedAlerts.filter(alert => 
                         // Active alerts: new ones targeted to them, or ones they've accepted
                         (alert.status === 'new' && alert.targetedOfficers?.includes(badgeNumber)) ||
                         (alert.status === 'accepted' && alert.acceptedBy === badgeNumber) ||
                         // Historical alerts are visible to all officers
-                        alert.status === 'resolved' ||
-                        alert.status === 'canceled' ||
-                        alert.status === 'timed_out'
+                        ['resolved', 'canceled', 'timed_out'].includes(alert.status)
                     );
-
-                    client.send(JSON.stringify({ type: 'alerts', payload: policeVisibleAlerts }), (err) => {
-                        if (err) {
-                            console.error('WebSocket send error:', err);
-                            clients.delete(client);
-                            clientMetadata.delete(client);
-                        }
-                    });
+                } else if (metadata.role === 'citizen') {
+                    // For citizens, send all alerts. The frontend will filter.
+                    // This ensures they get updates on their own alerts.
+                    alertsToSend = formattedAlerts;
                 }
+                
+                // Always send the current list of relevant alerts.
+                // An empty list is valid data (e.g., for police with no assigned alerts).
+                client.send(JSON.stringify({ type: 'alerts', payload: alertsToSend }), (err) => {
+                    if (err) {
+                        console.error('WebSocket send error:', err);
+                        clients.delete(client);
+                        clientMetadata.delete(client);
+                    }
+                });
             }
         });
     } catch (error) {
@@ -211,23 +218,8 @@ wss.on('connection', (ws) => {
           if (parsedMessage.type === 'auth' && parsedMessage.payload) {
               console.log(`Authenticating client for user:`, parsedMessage.payload);
               clientMetadata.set(ws, parsedMessage.payload);
-
-              // Once authenticated, send the initial, filtered list of alerts.
-              if (parsedMessage.payload.role === 'police') {
-                  const badgeNumber = parsedMessage.payload.mobile;
-                  const allAlerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
-                  const formattedAlerts = formatAlerts(allAlerts);
-                  
-                  const policeVisibleAlerts = formattedAlerts.filter(alert => 
-                      (alert.status === 'new' && alert.targetedOfficers?.includes(badgeNumber)) ||
-                      (alert.status === 'accepted' && alert.acceptedBy === badgeNumber) ||
-                      alert.status === 'resolved' ||
-                      alert.status === 'canceled' ||
-                      alert.status === 'timed_out'
-                  );
-
-                  ws.send(JSON.stringify({ type: 'alerts', payload: policeVisibleAlerts }));
-              }
+              // The initial alert list is now fetched via HTTP on the client-side
+              // to prevent race conditions. The WebSocket is only for real-time updates.
           }
       } catch (e) {
           console.error('Failed to process message:', e);
