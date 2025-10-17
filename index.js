@@ -4,10 +4,12 @@ const http = require('http');
 const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
+const { Expo } = require('expo-server-sdk');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+const expo = new Expo();
 
 const PORT = 3001;
 
@@ -62,7 +64,8 @@ async function setupDatabase() {
             badgeNumber TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             designation TEXT NOT NULL,
-            phoneNumber TEXT NOT NULL
+            phoneNumber TEXT NOT NULL,
+            pushToken TEXT
         );
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,27 +86,19 @@ async function setupDatabase() {
     // --- Simple Migration: Add missing columns if they don't exist ---
     // This makes the app resilient to schema changes on existing databases.
     const alertsInfo = await db.all("PRAGMA table_info(alerts)");
-    const columnNames = alertsInfo.map(col => col.name);
+    const alertsColumnNames = alertsInfo.map(col => col.name);
 
-    if (!columnNames.includes('locationLat')) {
-        console.log('Migrating database: Adding locationLat column to alerts table.');
-        await db.exec('ALTER TABLE alerts ADD COLUMN locationLat REAL');
-    }
-    if (!columnNames.includes('locationLng')) {
-        console.log('Migrating database: Adding locationLng column to alerts table.');
-        await db.exec('ALTER TABLE alerts ADD COLUMN locationLng REAL');
-    }
-    if (!columnNames.includes('searchRadius')) {
-        console.log('Migrating database: Adding searchRadius column to alerts table.');
-        await db.exec('ALTER TABLE alerts ADD COLUMN searchRadius INTEGER');
-    }
-    if (!columnNames.includes('timeoutTimestamp')) {
-        console.log('Migrating database: Adding timeoutTimestamp column to alerts table.');
-        await db.exec('ALTER TABLE alerts ADD COLUMN timeoutTimestamp INTEGER');
-    }
-    if (!columnNames.includes('targetedOfficers')) {
-        console.log('Migrating database: Adding targetedOfficers column to alerts table.');
-        await db.exec('ALTER TABLE alerts ADD COLUMN targetedOfficers TEXT');
+    if (!alertsColumnNames.includes('locationLat')) await db.exec('ALTER TABLE alerts ADD COLUMN locationLat REAL');
+    if (!alertsColumnNames.includes('locationLng')) await db.exec('ALTER TABLE alerts ADD COLUMN locationLng REAL');
+    if (!alertsColumnNames.includes('searchRadius')) await db.exec('ALTER TABLE alerts ADD COLUMN searchRadius INTEGER');
+    if (!alertsColumnNames.includes('timeoutTimestamp')) await db.exec('ALTER TABLE alerts ADD COLUMN timeoutTimestamp INTEGER');
+    if (!alertsColumnNames.includes('targetedOfficers')) await db.exec('ALTER TABLE alerts ADD COLUMN targetedOfficers TEXT');
+
+    const policeInfo = await db.all("PRAGMA table_info(police)");
+    const policeColumnNames = policeInfo.map(col => col.name);
+    if (!policeColumnNames.includes('pushToken')) {
+        console.log('Migrating database: Adding pushToken column to police table.');
+        await db.exec('ALTER TABLE police ADD COLUMN pushToken TEXT');
     }
 
     console.log('Database connected and tables ensured.');
@@ -172,7 +167,7 @@ const broadcastAlerts = async () => {
                     // This ensures they get updates on their own alerts.
                     alertsToSend = formattedAlerts;
                 }
-                
+
                 // Always send the current list of relevant alerts.
                 // An empty list is valid data (e.g., for police with no assigned alerts).
                 client.send(JSON.stringify({ type: 'alerts', payload: alertsToSend }), (err) => {
@@ -335,6 +330,20 @@ app.post('/api/police/login', async (req, res) => {
     }
 });
 
+// POST to update an officer's push token
+app.post('/api/police/pushtoken', async (req, res) => {
+    const { badgeNumber, token } = req.body;
+    if (!badgeNumber || !token) return res.status(400).json({ message: 'Badge number and token are required.' });
+    try {
+        await db.run('UPDATE police SET pushToken = ? WHERE badgeNumber = ?', [token, badgeNumber]);
+        console.log(`Updated push token for officer ${badgeNumber}.`);
+        res.status(204).send();
+    } catch (err) {
+        console.error('Error updating push token:', err);
+        res.status(500).json({ message: 'Server error while updating push token.' });
+    }
+});
+
 // POST to update an officer's location
 app.post('/api/police/location', (req, res) => {
     const { badgeNumber, location } = req.body;
@@ -409,6 +418,33 @@ app.post('/api/alerts', async (req, res) => {
           targetedOfficers: targetedOfficers,
       };
 
+      // --- Send Push Notifications ---
+      if (targetedOfficers.length > 0) {
+        const officersWithTokens = await db.all(`SELECT pushToken FROM police WHERE badgeNumber IN (${targetedOfficers.map(() => '?').join(',')})`, targetedOfficers);
+        const pushTokens = officersWithTokens.map(o => o.pushToken).filter(t => Expo.isExpoPushToken(t));
+        
+        if (pushTokens.length > 0) {
+            console.log(`Sending push notifications to ${pushTokens.length} officers.`);
+            const messages = pushTokens.map(pushToken => ({
+                to: pushToken,
+                sound: 'default',
+                title: 'New Emergency Alert',
+                body: message || 'A new voice alert has been received nearby.',
+                data: { alertId: newAlertId }, // Send alert ID to deeplink
+            }));
+            const chunks = expo.chunkPushNotifications(messages);
+            (async () => {
+                for (const chunk of chunks) {
+                    try {
+                        await expo.sendPushNotificationsAsync(chunk);
+                    } catch (error) {
+                        console.error('Error sending push notification chunk:', error);
+                    }
+                }
+            })();
+        }
+      }
+
       // Set timers for escalation and timeout
       const escalationTimer = setTimeout(async () => {
         const currentAlert = await db.get('SELECT status, locationLat, locationLng FROM alerts WHERE id = ?', [newAlertId]);
@@ -470,9 +506,12 @@ app.post('/api/alerts/:id/accept', async (req, res) => {
         await db.run('UPDATE alerts SET status = ?, acceptedBy = ? WHERE id = ?', ['accepted', officerId, alertId]);
         clearAlertTimers(alertId);
         
+        const updatedAlert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
+        if (!updatedAlert) return res.status(404).json({ message: 'Alert not found after update.' });
+
         console.log(`Alert ${alertId} accepted by officer ${officerId}`);
         broadcastAlerts();
-        res.status(200).json({ message: 'Alert accepted' });
+        res.status(200).json(formatAlerts([updatedAlert])[0]);
     } catch (err) {
         console.error(`Error accepting alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while accepting alert.' });
@@ -493,9 +532,12 @@ app.post('/api/alerts/:id/resolve', async (req, res) => {
         
         await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['resolved', alertId]);
 
+        const updatedAlert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
+        if (!updatedAlert) return res.status(404).json({ message: 'Alert not found after update.' });
+
         console.log(`Alert ${alertId} resolved.`);
         broadcastAlerts();
-        res.status(200).json({ message: 'Alert resolved' });
+        res.status(200).json(formatAlerts([updatedAlert])[0]);
     } catch (err) {
         console.error(`Error resolving alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while resolving alert.' });
@@ -517,9 +559,12 @@ app.post('/api/alerts/:id/cancel', async (req, res) => {
         await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['canceled', alertId]);
         clearAlertTimers(alertId);
 
+        const updatedAlert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
+        if (!updatedAlert) return res.status(404).json({ message: 'Alert not found after update.' });
+
         console.log(`Alert ${alertId} canceled by citizen.`);
         broadcastAlerts();
-        res.status(200).json({ message: 'Alert canceled' });
+        res.status(200).json(formatAlerts([updatedAlert])[0]);
     } catch (err) {
         console.error(`Error canceling alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while canceling alert.' });
