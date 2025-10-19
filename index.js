@@ -5,6 +5,7 @@ const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
 const { Expo } = require('expo-server-sdk');
+const polyline = require('@mapbox/polyline');
 
 const app = express();
 const server = http.createServer(app);
@@ -53,8 +54,6 @@ async function setupDatabase() {
         driver: sqlite3.Database
     });
 
-    // The CREATE TABLE statement is kept with all columns for new database setups.
-    // The migration logic below will handle existing databases.
     await db.exec(`
         CREATE TABLE IF NOT EXISTS citizens (
             username TEXT PRIMARY KEY,
@@ -84,7 +83,6 @@ async function setupDatabase() {
     `);
 
     // --- Simple Migration: Add missing columns if they don't exist ---
-    // This makes the app resilient to schema changes on existing databases.
     const alertsInfo = await db.all("PRAGMA table_info(alerts)");
     const alertsColumnNames = alertsInfo.map(col => col.name);
 
@@ -167,9 +165,7 @@ const broadcastAlerts = async () => {
                     // This ensures they get updates on their own alerts.
                     alertsToSend = formattedAlerts;
                 }
-
-                // Always send the current list of relevant alerts.
-                // An empty list is valid data (e.g., for police with no assigned alerts).
+                
                 client.send(JSON.stringify({ type: 'alerts', payload: alertsToSend }), (err) => {
                     if (err) {
                         console.error('WebSocket send error:', err);
@@ -204,7 +200,6 @@ wss.on('connection', (ws) => {
   clients.add(ws);
   console.log('Client connected. Total clients:', clients.size);
 
-  // Send initial location data to the new client
   broadcastLocations();
 
   ws.on('message', async (message) => {
@@ -249,6 +244,47 @@ const clearAlertTimers = (alertId) => {
 app.get('/', (req, res) => {
   res.send('Citizen Safety Backend is running.');
 });
+
+// GET route to fetch turn-by-turn directions from Google Maps API
+app.get('/api/route', async (req, res) => {
+    const { origin, destination } = req.query;
+    if (!origin || !destination) {
+        return res.status(400).json({ message: 'Origin and destination are required.' });
+    }
+
+    const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+    if (!GOOGLE_MAPS_API_KEY) {
+        console.error("GOOGLE_MAPS_API_KEY is not set in the environment.");
+        return res.status(500).json({ message: 'Server configuration error: Missing Maps API key.' });
+    }
+
+    const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${origin}&destination=${destination}&key=${GOOGLE_MAPS_API_KEY}`;
+
+    try {
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (data.status !== 'OK' || !data.routes || data.routes.length === 0) {
+            console.warn('Google Directions API did not return a valid route.', data.status, data.error_message);
+            return res.status(404).json({ message: 'Could not find a route.', details: data.error_message });
+        }
+
+        const encodedPolyline = data.routes[0].overview_polyline.points;
+        const decodedCoords = polyline.decode(encodedPolyline);
+        
+        // Map [lat, lng] pairs to {lat, lng} objects
+        const routeCoordinates = decodedCoords.map(coord => ({
+            lat: coord[0],
+            lng: coord[1],
+        }));
+        
+        res.status(200).json(routeCoordinates);
+    } catch (error) {
+        console.error('Error fetching directions from Google Maps API:', error);
+        res.status(500).json({ message: 'Failed to fetch route.' });
+    }
+});
+
 
 // Citizen Registration
 app.post('/api/citizen/register', async (req, res) => {
@@ -406,16 +442,8 @@ app.post('/api/alerts', async (req, res) => {
       
       const newAlertId = result.lastID;
       const newAlert = {
-          id: newAlertId,
-          citizenId,
-          message,
-          audioBase64,
-          location,
-          timestamp,
-          status: 'new',
-          searchRadius: 5,
-          timeoutTimestamp: timeoutTimestamp,
-          targetedOfficers: targetedOfficers,
+          id: newAlertId, citizenId, message, audioBase64, location, timestamp,
+          status: 'new', searchRadius: 5, timeoutTimestamp, targetedOfficers,
       };
 
       // --- Send Push Notifications ---

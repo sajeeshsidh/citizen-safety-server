@@ -15,6 +15,7 @@
     "sqlite": "^5.1.1",
     "sqlite3": "^5.1.7",
     "ws": "^8.17.1",
-    "expo-server-sdk": "^4.0.0"
+    "expo-server-sdk": "^4.0.0",
+    "@mapbox/polyline": "^1.2.1"
   }
 }
