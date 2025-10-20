@@ -4,15 +4,49 @@ const http = require('http');
 const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
+const { Expo } = require('expo-server-sdk');
+const polyline = require('@mapbox/polyline');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+const expo = new Expo();
 
 const PORT = 3001;
 
 // --- Database Setup ---
 let db;
+
+/**
+ * Calculates the distance between two lat/lng coordinates in kilometers.
+ * @param {{lat: number, lng: number}} coords1 - The first coordinate.
+ * @param {{lat: number, lng: number}} coords2 - The second coordinate.
+ * @returns {number} The distance in kilometers.
+ */
+function haversineDistance(coords1, coords2) {
+    function toRad(x) {
+        return x * Math.PI / 180;
+    }
+
+    const lat1 = coords1.lat;
+    const lon1 = coords1.lng;
+    const lat2 = coords2.lat;
+    const lon2 = coords2.lng;
+
+    const R = 6371; // Earth's radius in km
+
+    const x1 = lat2 - lat1;
+    const dLat = toRad(x1);
+    const x2 = lon2 - lon1;
+    const dLon = toRad(x2);
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    
+    return R * c;
+}
+
 
 async function setupDatabase() {
     db = await open({
@@ -29,7 +63,8 @@ async function setupDatabase() {
             badgeNumber TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             designation TEXT NOT NULL,
-            phoneNumber TEXT NOT NULL
+            phoneNumber TEXT NOT NULL,
+            pushToken TEXT
         );
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,46 +75,63 @@ async function setupDatabase() {
             locationLng REAL,
             timestamp INTEGER NOT NULL,
             status TEXT NOT NULL,
-            acceptedBy TEXT
+            acceptedBy TEXT,
+            searchRadius INTEGER,
+            timeoutTimestamp INTEGER,
+            targetedOfficers TEXT
         );
     `);
+
+    // --- Simple Migration: Add missing columns if they don't exist ---
+    const alertsInfo = await db.all("PRAGMA table_info(alerts)");
+    const alertsColumnNames = alertsInfo.map(col => col.name);
+
+    if (!alertsColumnNames.includes('locationLat')) await db.exec('ALTER TABLE alerts ADD COLUMN locationLat REAL');
+    if (!alertsColumnNames.includes('locationLng')) await db.exec('ALTER TABLE alerts ADD COLUMN locationLng REAL');
+    if (!alertsColumnNames.includes('searchRadius')) await db.exec('ALTER TABLE alerts ADD COLUMN searchRadius INTEGER');
+    if (!alertsColumnNames.includes('timeoutTimestamp')) await db.exec('ALTER TABLE alerts ADD COLUMN timeoutTimestamp INTEGER');
+    if (!alertsColumnNames.includes('targetedOfficers')) await db.exec('ALTER TABLE alerts ADD COLUMN targetedOfficers TEXT');
+
+    const policeInfo = await db.all("PRAGMA table_info(police)");
+    const policeColumnNames = policeInfo.map(col => col.name);
+    if (!policeColumnNames.includes('pushToken')) {
+        console.log('Migrating database: Adding pushToken column to police table.');
+        await db.exec('ALTER TABLE police ADD COLUMN pushToken TEXT');
+    }
+
     console.log('Database connected and tables ensured.');
 }
 
 
-// In-memory store for real-time, non-persistent data like officer locations
+// In-memory store for real-time, non-persistent data
 const officerLocations = {
     '728': { lat: 34.06, lng: -118.25 },
     '551': { lat: 34.045, lng: -118.26 },
     '912': { lat: 34.055, lng: -118.23 },
 };
+const alertTimers = new Map();
+
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // --- WebSocket Logic ---
 const clients = new Set();
-
-const broadcastData = (data) => {
-    const dataString = JSON.stringify(data);
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(dataString, (err) => {
-                if (err) {
-                    console.error('WebSocket send error:', err);
-                    clients.delete(client);
-                }
-            });
-        }
-    });
-};
+const clientMetadata = new Map(); // Stores metadata for each client (e.g., role, badgeNumber)
 
 const formatAlerts = (alerts) => {
     return alerts.map(alert => {
-        const { locationLat, locationLng, ...rest } = alert;
+        const { locationLat, locationLng, targetedOfficers, ...rest } = alert;
         const newAlert = { ...rest };
         if (locationLat != null && locationLng != null) {
             newAlert.location = { lat: locationLat, lng: locationLng };
+        }
+        try {
+            // Safely parse the targetedOfficers JSON string
+            newAlert.targetedOfficers = targetedOfficers ? JSON.parse(targetedOfficers) : [];
+        } catch (e) {
+            console.error(`Error parsing targetedOfficers for alert ${alert.id}:`, e);
+            newAlert.targetedOfficers = [];
         }
         return newAlert;
     });
@@ -87,8 +139,42 @@ const formatAlerts = (alerts) => {
 
 const broadcastAlerts = async () => {
     try {
-        const alerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
-        broadcastData({ type: 'alerts', payload: formatAlerts(alerts) });
+        const allAlerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
+        const formattedAlerts = formatAlerts(allAlerts);
+
+        clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                const metadata = clientMetadata.get(client);
+                if (!metadata) {
+                    return; // Skip unauthenticated clients
+                }
+
+                let alertsToSend = [];
+                if (metadata.role === 'police') {
+                    const badgeNumber = metadata.mobile;
+                    
+                    alertsToSend = formattedAlerts.filter(alert => 
+                        // Active alerts: new ones targeted to them, or ones they've accepted
+                        (alert.status === 'new' && alert.targetedOfficers?.includes(badgeNumber)) ||
+                        (alert.status === 'accepted' && alert.acceptedBy === badgeNumber) ||
+                        // Historical alerts are visible to all officers
+                        ['resolved', 'canceled', 'timed_out'].includes(alert.status)
+                    );
+                } else if (metadata.role === 'citizen') {
+                    // For citizens, send all alerts. The frontend will filter.
+                    // This ensures they get updates on their own alerts.
+                    alertsToSend = formattedAlerts;
+                }
+                
+                client.send(JSON.stringify({ type: 'alerts', payload: alertsToSend }), (err) => {
+                    if (err) {
+                        console.error('WebSocket send error:', err);
+                        clients.delete(client);
+                        clientMetadata.delete(client);
+                    }
+                });
+            }
+        });
     } catch (error) {
         console.error("Failed to fetch and broadcast alerts:", error);
     }
@@ -99,41 +185,106 @@ const broadcastLocations = () => {
         badgeNumber,
         location,
     }));
-    broadcastData({ type: 'locations', payload: locationsArray });
+     const dataString = JSON.stringify({ type: 'locations', payload: locationsArray });
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(dataString);
+        }
+    });
 };
 
 // Periodically broadcast locations to all clients
 setInterval(broadcastLocations, 2000);
 
-wss.on('connection', async (ws) => {
+wss.on('connection', (ws) => {
   clients.add(ws);
   console.log('Client connected. Total clients:', clients.size);
 
-  // Send the current list of alerts and locations to the newly connected client
-  try {
-      const alerts = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
-      ws.send(JSON.stringify({ type: 'alerts', payload: formatAlerts(alerts) }));
-  } catch (error) {
-      console.error("Failed to send initial alerts to new client:", error);
-  }
-  
-  broadcastLocations(); // Send latest locations immediately on connect
+  broadcastLocations();
+
+  ws.on('message', async (message) => {
+      try {
+          const parsedMessage = JSON.parse(message);
+          if (parsedMessage.type === 'auth' && parsedMessage.payload) {
+              console.log(`Authenticating client for user:`, parsedMessage.payload);
+              clientMetadata.set(ws, parsedMessage.payload);
+              // The initial alert list is now fetched via HTTP on the client-side
+              // to prevent race conditions. The WebSocket is only for real-time updates.
+          }
+      } catch (e) {
+          console.error('Failed to process message:', e);
+      }
+  });
 
   ws.on('close', () => {
     clients.delete(ws);
+    clientMetadata.delete(ws); // Clean up metadata
     console.log('Client disconnected. Total clients:', clients.size);
   });
 
   ws.on('error', (error) => {
     console.error('WebSocket error:', error);
+    clients.delete(ws);
+    clientMetadata.delete(ws);
   });
 });
+
+const clearAlertTimers = (alertId) => {
+    const timers = alertTimers.get(alertId);
+    if (timers) {
+        clearTimeout(timers.escalationTimer);
+        clearTimeout(timers.timeoutTimer);
+        alertTimers.delete(alertId);
+        console.log(`Cleared timers for alert ${alertId}`);
+    }
+};
 
 // --- Routes ---
 
 app.get('/', (req, res) => {
   res.send('Citizen Safety Backend is running.');
 });
+
+// GET route to fetch turn-by-turn directions from Google Maps API
+app.get('/api/route', async (req, res) => {
+    const { origin, destination } = req.query;
+    if (!origin || !destination) {
+        return res.status(400).json({ message: 'Origin and destination are required.' });
+    }
+
+    const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+    if (!GOOGLE_MAPS_API_KEY) {
+        console.error("GOOGLE_MAPS_API_KEY is not set in the environment.");
+        return res.status(500).json({ message: 'Server configuration error: Missing Maps API key.' });
+    }
+
+    const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${origin}&destination=${destination}&key=${GOOGLE_MAPS_API_KEY}`;
+
+    try {
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (data.status !== 'OK' || !data.routes || data.routes.length === 0) {
+            console.warn('Google Directions API did not return a valid route.', data.status, data.error_message);
+            return res.status(404).json({ message: 'Could not find a route.', details: data.error_message });
+        }
+
+        const encodedPolyline = data.routes[0].overview_polyline.points;
+        const decodedCoords = polyline.decode(encodedPolyline);
+        
+        // Map [lat, lng] pairs to {lat, lng} objects
+        const routeCoordinates = decodedCoords.map(coord => ({
+            lat: coord[0],
+            lng: coord[1],
+        }));
+        
+        res.status(200).json(routeCoordinates);
+    } catch (error) {
+        console.error('Error fetching directions from Google Maps API:', error);
+        res.status(500).json({ message: 'Failed to fetch route.' });
+    }
+});
+
 
 // Citizen Registration
 app.post('/api/citizen/register', async (req, res) => {
@@ -215,6 +366,20 @@ app.post('/api/police/login', async (req, res) => {
     }
 });
 
+// POST to update an officer's push token
+app.post('/api/police/pushtoken', async (req, res) => {
+    const { badgeNumber, token } = req.body;
+    if (!badgeNumber || !token) return res.status(400).json({ message: 'Badge number and token are required.' });
+    try {
+        await db.run('UPDATE police SET pushToken = ? WHERE badgeNumber = ?', [token, badgeNumber]);
+        console.log(`Updated push token for officer ${badgeNumber}.`);
+        res.status(204).send();
+    } catch (err) {
+        console.error('Error updating push token:', err);
+        res.status(500).json({ message: 'Server error while updating push token.' });
+    }
+});
+
 // POST to update an officer's location
 app.post('/api/police/location', (req, res) => {
     const { badgeNumber, location } = req.body;
@@ -253,20 +418,96 @@ app.post('/api/alerts', async (req, res) => {
   if (!citizenId) return res.status(400).json({ message: 'Citizen ID is required.' });
 
   try {
+      const timestamp = Date.now();
+      const TIMEOUT_DURATION = 60 * 1000;
+      const timeoutTimestamp = timestamp + TIMEOUT_DURATION;
+      const TIMEOUT_ESCALATE = 30 * 1000;
+      
+      // Perform initial 5km search for officers
+      let targetedOfficers = [];
+      if (location) {
+          targetedOfficers = Object.entries(officerLocations)
+              .filter(([badgeNumber, officerLocation]) => {
+                  const distance = haversineDistance(location, officerLocation);
+                  return distance <= 5; // Initial 5km radius
+              })
+              .map(([badgeNumber]) => badgeNumber);
+      }
+      console.log(`Alert created. Targeting ${targetedOfficers.length} officers within 5km.`);
+
       const result = await db.run(
-          'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [citizenId, message || null, audioBase64 || null, location?.lat || null, location?.lng || null, Date.now(), 'new']
+          'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, searchRadius, timeoutTimestamp, targetedOfficers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [citizenId, message || null, audioBase64 || null, location?.lat || null, location?.lng || null, timestamp, 'new', 5, timeoutTimestamp, JSON.stringify(targetedOfficers)]
       );
       
+      const newAlertId = result.lastID;
       const newAlert = {
-          id: result.lastID,
-          citizenId,
-          message,
-          audioBase64,
-          location,
-          timestamp: Date.now(),
-          status: 'new'
+          id: newAlertId, citizenId, message, audioBase64, location, timestamp,
+          status: 'new', searchRadius: 5, timeoutTimestamp, targetedOfficers,
       };
+
+      // --- Send Push Notifications ---
+      if (targetedOfficers.length > 0) {
+        const officersWithTokens = await db.all(`SELECT pushToken FROM police WHERE badgeNumber IN (${targetedOfficers.map(() => '?').join(',')})`, targetedOfficers);
+        const pushTokens = officersWithTokens.map(o => o.pushToken).filter(t => Expo.isExpoPushToken(t));
+        
+        if (pushTokens.length > 0) {
+            console.log(`Sending push notifications to ${pushTokens.length} officers.`);
+            const messages = pushTokens.map(pushToken => ({
+                to: pushToken,
+                sound: 'default',
+                title: 'New Emergency Alert',
+                body: message || 'A new voice alert has been received nearby.',
+                data: { alertId: newAlertId }, // Send alert ID to deeplink
+            }));
+            const chunks = expo.chunkPushNotifications(messages);
+            (async () => {
+                for (const chunk of chunks) {
+                    try {
+                        await expo.sendPushNotificationsAsync(chunk);
+                    } catch (error) {
+                        console.error('Error sending push notification chunk:', error);
+                    }
+                }
+            })();
+        }
+      }
+
+      // Set timers for escalation and timeout
+      const escalationTimer = setTimeout(async () => {
+        const currentAlert = await db.get('SELECT status, locationLat, locationLng FROM alerts WHERE id = ?', [newAlertId]);
+        if (currentAlert && currentAlert.status === 'new') {
+            console.log(`Escalating search for alert ${newAlertId}`);
+            
+            let escalatedTargetedOfficers = [];
+            if (currentAlert.locationLat && currentAlert.locationLng) {
+                const alertLocation = { lat: currentAlert.locationLat, lng: currentAlert.locationLng };
+                escalatedTargetedOfficers = Object.entries(officerLocations)
+                    .filter(([badgeNumber, officerLocation]) => {
+                        const distance = haversineDistance(alertLocation, officerLocation);
+                        return distance <= 10; // New 10km radius
+                    })
+                    .map(([badgeNumber]) => badgeNumber);
+            }
+            console.log(`Escalated search targeting ${escalatedTargetedOfficers.length} officers within 10km.`);
+
+            await db.run('UPDATE alerts SET searchRadius = ?, targetedOfficers = ? WHERE id = ?', [10, JSON.stringify(escalatedTargetedOfficers), newAlertId]);
+            broadcastAlerts();
+        }
+      }, TIMEOUT_ESCALATE);
+
+      const timeoutTimer = setTimeout(async () => {
+        const currentAlert = await db.get('SELECT status FROM alerts WHERE id = ?', [newAlertId]);
+        if (currentAlert && currentAlert.status === 'new') {
+            console.log(`Timing out alert ${newAlertId}`);
+            await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['timed_out', newAlertId]);
+            broadcastAlerts();
+        }
+        alertTimers.delete(newAlertId);
+      }, TIMEOUT_DURATION);
+
+      alertTimers.set(newAlertId, { escalationTimer, timeoutTimer });
+
       console.log('New alert created:', newAlert.id);
       broadcastAlerts();
       res.status(201).json(newAlert);
@@ -278,88 +519,100 @@ app.post('/api/alerts', async (req, res) => {
 
 // POST to accept an alert
 app.post('/api/alerts/:id/accept', async (req, res) => {
-    const { id } = req.params;
+    const alertId = parseInt(req.params.id, 10);
     const { officerId } = req.body;
     if (!officerId) return res.status(400).json({ message: 'Officer ID is required.' });
 
     try {
-        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [id]);
+        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
         if (!alert) return res.status(404).json({ message: 'Alert not found.' });
 
         if (alert.status !== 'new') {
             return res.status(409).json({ message: 'Alert has already been accepted or does not exist.' });
         }
         
-        await db.run('UPDATE alerts SET status = ?, acceptedBy = ? WHERE id = ?', ['accepted', officerId, id]);
+        await db.run('UPDATE alerts SET status = ?, acceptedBy = ? WHERE id = ?', ['accepted', officerId, alertId]);
+        clearAlertTimers(alertId);
         
-        console.log(`Alert ${id} accepted by officer ${officerId}`);
+        const updatedAlert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
+        if (!updatedAlert) return res.status(404).json({ message: 'Alert not found after update.' });
+
+        console.log(`Alert ${alertId} accepted by officer ${officerId}`);
         broadcastAlerts();
-        res.status(200).json({ message: 'Alert accepted' });
+        res.status(200).json(formatAlerts([updatedAlert])[0]);
     } catch (err) {
-        console.error(`Error accepting alert ${id}:`, err);
+        console.error(`Error accepting alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while accepting alert.' });
     }
 });
 
 // POST to resolve an alert
 app.post('/api/alerts/:id/resolve', async (req, res) => {
-    const { id } = req.params;
+    const alertId = parseInt(req.params.id, 10);
     
     try {
-        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [id]);
+        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
         if (!alert) return res.status(404).json({ message: 'Alert not found.' });
         
         if (alert.status !== 'accepted') {
             return res.status(409).json({ message: 'Alert must be accepted to be resolved.' });
         }
         
-        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['resolved', id]);
+        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['resolved', alertId]);
 
-        console.log(`Alert ${id} resolved.`);
+        const updatedAlert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
+        if (!updatedAlert) return res.status(404).json({ message: 'Alert not found after update.' });
+
+        console.log(`Alert ${alertId} resolved.`);
         broadcastAlerts();
-        res.status(200).json({ message: 'Alert resolved' });
+        res.status(200).json(formatAlerts([updatedAlert])[0]);
     } catch (err) {
-        console.error(`Error resolving alert ${id}:`, err);
+        console.error(`Error resolving alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while resolving alert.' });
     }
 });
 
 // POST to cancel an alert
 app.post('/api/alerts/:id/cancel', async (req, res) => {
-    const { id } = req.params;
+    const alertId = parseInt(req.params.id, 10);
     
     try {
-        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [id]);
+        const alert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
         if (!alert) return res.status(404).json({ message: 'Alert not found.' });
         
         if (alert.status !== 'new' && alert.status !== 'accepted') {
             return res.status(409).json({ message: `Alert could not be canceled (it might already be resolved).` });
         }
         
-        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['canceled', id]);
+        await db.run('UPDATE alerts SET status = ? WHERE id = ?', ['canceled', alertId]);
+        clearAlertTimers(alertId);
 
-        console.log(`Alert ${id} canceled by citizen.`);
+        const updatedAlert = await db.get('SELECT * FROM alerts WHERE id = ?', [alertId]);
+        if (!updatedAlert) return res.status(404).json({ message: 'Alert not found after update.' });
+
+        console.log(`Alert ${alertId} canceled by citizen.`);
         broadcastAlerts();
-        res.status(200).json({ message: 'Alert canceled' });
+        res.status(200).json(formatAlerts([updatedAlert])[0]);
     } catch (err) {
-        console.error(`Error canceling alert ${id}:`, err);
+        console.error(`Error canceling alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while canceling alert.' });
     }
 });
 
 // DELETE a single alert
 app.delete('/api/alerts/:id', async (req, res) => {
-    const { id } = req.params;
+    const alertId = parseInt(req.params.id, 10);
     try {
-        const result = await db.run('DELETE FROM alerts WHERE id = ?', [id]);
+        const result = await db.run('DELETE FROM alerts WHERE id = ?', [alertId]);
         if (result.changes === 0) {
             return res.status(404).json({ message: 'Alert not found.' });
         }
-        console.log(`Alert ${id} deleted.`);
+        clearAlertTimers(alertId);
+        console.log(`Alert ${alertId} deleted.`);
         broadcastAlerts();
         res.status(204).send();
     } catch (err) {
-        console.error(`Error deleting alert ${id}:`, err);
+        console.error(`Error deleting alert ${alertId}:`, err);
         res.status(500).json({ message: 'Server error while deleting alert.' });
     }
 });
