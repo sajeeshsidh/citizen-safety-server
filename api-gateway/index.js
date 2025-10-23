@@ -2,12 +2,10 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { createProxyMiddleware } = require('http-proxy-middleware');
+const fetch = require('node-fetch');
+const WebSocket = require('ws');
 
-// --- Configuration ---
-// These URLs point to the independent microservices.
-// In a real deployment (like on Render), these would be internal service addresses.
-
-const PORT = process.env.PORT || 3001;
+// --- Environment Configuration ---
 const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL || 'http://localhost:3002';
 const ALERTS_SERVICE_URL = process.env.ALERTS_SERVICE_URL || 'http://localhost:3003';
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3004';
@@ -15,8 +13,10 @@ const DIRECTIONS_SERVICE_URL = process.env.DIRECTIONS_SERVICE_URL || 'http://loc
 const WEBSOCKET_SERVICE_URL = process.env.WEBSOCKET_SERVICE_URL || 'ws://localhost:3006';
 const AI_ANALYSIS_SERVICE_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://localhost:3007';
 
+const PORT = process.env.PORT || 3001;
+const PROXY_TIMEOUT_MS = 120000; // 120 seconds (2 minutes) to handle cascading cold starts
 
-// --- Express App & Server Setup ---
+// --- Initialize Express App ---
 const app = express();
 const server = http.createServer(app);
 
@@ -28,126 +28,131 @@ app.get('/', (req, res) => {
     res.send('API Gateway is running.');
 });
 
-// --- Diagnostic Logging ---
-const logProvider = (providerName, target) => {
-    return (proxyReq, req, res) => {
-        console.log(`[API Gateway] Proxying request ${req.method} ${req.originalUrl} to ${providerName} at ${target}`);
+// --- Proxy Event Handlers ---
+
+/**
+ * Logs when a request is forwarded to a downstream service.
+ */
+const onProxyReq = (proxyReq, req, res) => {
+    // Construct the target from the proxy request object itself, which is more reliable
+    // than trying to access internal properties of the http-proxy agent.
+    const targetHost = `${proxyReq.protocol}//${proxyReq.host}`;
+    console.log(`[Proxy] Forwarding ${req.method} request to ${targetHost}${req.originalUrl}`);
+};
+
+/**
+ * Logs when a response is received from a downstream service.
+ */
+const onProxyRes = (proxyRes, req, res) => {
+    // The `proxyRes` is an `http.IncomingMessage`, and its `req` property
+    // is the `http.ClientRequest` (our `proxyReq`). We can use this to get the target.
+    const targetHost = `${proxyRes.req.protocol}//${proxyRes.req.host}`;
+    console.log(`[Proxy] Received response with status ${proxyRes.statusCode} from ${targetHost}${req.originalUrl}`);
+};
+
+/**
+ * Handles errors from the proxy, such as timeouts or connection failures.
+ */
+const onError = (err, req, res, target) => {
+    console.error(`[Proxy] Error for ${req.method} ${req.originalUrl} to ${target}:`, err.message);
+    if (!res.headersSent) {
+        const statusCode = (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') ? 504 : 503;
+        const message = statusCode === 504
+            ? `Gateway Timeout: The service at ${target} did not respond in time.`
+            : `Service Unavailable: Could not connect to the service at ${target}.`;
+
+        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ message, code: err.code }));
+    }
+};
+
+/**
+ * Creates a configuration object for the http-proxy-middleware.
+ * @param {string} target - The base URL of the target service.
+ * @param {object|null} pathRewrite - Optional path rewriting rules.
+ * @returns {object} The configuration object for the proxy.
+ */
+const createProxyOptions = (target, pathRewrite = null) => {
+    const options = {
+        target,
+        changeOrigin: true,
+        proxyTimeout: PROXY_TIMEOUT_MS,
+        on: {
+            error: onError,
+            proxyReq: onProxyReq,
+            proxyRes: onProxyRes,
+        }
     };
+    if (pathRewrite) {
+        options.pathRewrite = pathRewrite;
+    }
+    return options;
 };
 
-// --- Error logging ---
-const proxyErrorHandler = (err, req, res, target) => {
-    console.error(`[API Gateway] Failed to connect to ${target} for ${req.originalUrl}:`, err.code);
-    res.status(503).json({
-        message: `Service Unavailable: Could not reach the back-end service at ${target}`,
-        code: err.code
-    });
-};
-
-// Add a simple logging middleware to see all incoming API requests
-app.use('/api', (req, res, next) => {
-    console.log(`[API Gateway] Received request: ${req.method} ${req.originalUrl}`);
-    next();
-});
-
-// --- Proxy Options ---
-const createProxyOptions = (targetUrl, providerName, pathRewriteMap = {}) => ({
-    target: targetUrl,
-    changeOrigin: true,
-    pathRewrite: pathRewriteMap,
-    onProxyReq: logProvider(providerName, targetUrl),
-    // --- New Error Handler ---
-    onError: (err, req, res) => proxyErrorHandler(err, req, res, targetUrl),
-    // Add debug logging to catch internal proxy errors
-    logLevel: 'debug'
-});
-
-// Define the options for each proxy once to avoid duplicating code.
-const authProxyOptions = createProxyOptions(
-    AUTH_SERVICE_URL,
-    'AuthService',
-    {}
-);
-const alertsProxyOptions = createProxyOptions(
-    ALERTS_SERVICE_URL,
-    'AlertsService',
-    {}
-);
-const locationProxyOptions = createProxyOptions(
-    LOCATION_SERVICE_URL,
-    'LocationService',
-    {}
-);
-const directionsProxyOptions = createProxyOptions(
-    DIRECTIONS_SERVICE_URL,
-    'DirectionsService',
-    {}
-);
-const aiProxyOptions = createProxyOptions(
-    AI_ANALYSIS_SERVICE_URL,
-    'AIService',
-    {}
-);
-
-// --- Routing Order ---
+// --- API Gateway Proxy Routing ---
 // The order is critical: more specific paths MUST be listed before general paths.
-// **Crucially, we create a NEW proxy instance for each route.**
 
-// 1. Location Service (Handles the most specific '/api/police' routes)
-app.use('/api/police/locations', createProxyMiddleware(locationProxyOptions));
-app.use('/api/police/location', createProxyMiddleware(locationProxyOptions));
+// 1. Internal APIs (not intended for direct client access)
+app.use('/api/internal/analyze', createProxyMiddleware(createProxyOptions(AI_ANALYSIS_SERVICE_URL)));
+app.use('/api/internal/find-nearby', createProxyMiddleware(createProxyOptions(LOCATION_SERVICE_URL)));
 
-// 2. Auth Service (Handles all other auth-related routes)
-app.use('/api/citizen', createProxyMiddleware(authProxyOptions));
-app.use('/api/police', createProxyMiddleware(authProxyOptions)); // Safe because specific police routes were handled above
-app.use('/api/firefighter', createProxyMiddleware(authProxyOptions));
+// 2. Location Service (Handles specific '/api/police' routes first to avoid being caught by the general auth proxy)
+app.use('/api/police/locations', createProxyMiddleware(createProxyOptions(LOCATION_SERVICE_URL)));
+app.use('/api/police/location', createProxyMiddleware(createProxyOptions(LOCATION_SERVICE_URL)));
 
-// 3. Other Services
-app.use('/api/alerts', createProxyMiddleware(alertsProxyOptions));
-app.use('/api/route', createProxyMiddleware(directionsProxyOptions));
-app.use('/api/internal/analyze', createProxyMiddleware(aiProxyOptions));
+// 3. Auth Service (Handles all general auth routes with path rewriting to decouple the service)
+const authRewriteRule = { '^/api': '' }; // Rewrites /api/citizen/login to /citizen/login
+app.use(['/api/citizen', '/api/police', '/api/firefighter'], createProxyMiddleware(createProxyOptions(AUTH_SERVICE_URL, authRewriteRule)));
 
-// --- WebSocket Proxying ---
+// 4. Other Public Services
+app.use('/api/alerts', createProxyMiddleware(createProxyOptions(ALERTS_SERVICE_URL)));
+app.use('/api/route', createProxyMiddleware(createProxyOptions(DIRECTIONS_SERVICE_URL)));
+
+
+// --- WebSocket Upgrade Handling ---
 server.on('upgrade', (req, socket, head) => {
     console.log('[API Gateway] Attempting to upgrade WebSocket connection...');
     const wsProxy = createProxyMiddleware({
         target: WEBSOCKET_SERVICE_URL,
         ws: true,
         changeOrigin: true,
-        logLevel: 'debug' // More verbose logging for websockets
     });
     wsProxy.upgrade(req, socket, head);
 });
 
+
 // --- Service Health Checks ---
-const checkServiceHealth = async (serviceName, url) => {
-    try {
-        if (url.startsWith('ws')) {
-            // For WebSocket services
-            return new Promise((resolve) => {
-                const ws = new WebSocket(url);
-                ws.on('open', () => {
-                    console.log(`[Health Check] ✅ ${serviceName} is running at ${url}`);
-                    ws.close();
-                    resolve(true);
+const checkServiceHealth = async (serviceName, url, retries = 3, delay = 3000) => {
+    for (let i = 1; i <= retries; i++) {
+        console.log(`[Health Check] Attempt ${i}/${retries} for ${serviceName} at ${url}...`);
+        try {
+            if (url.startsWith('ws')) {
+                await new Promise((resolve, reject) => {
+                    const ws = new WebSocket(url);
+                    ws.on('open', () => { ws.close(); resolve(true); });
+                    ws.on('error', (err) => { reject(err); });
+                    setTimeout(() => reject(new Error('WebSocket connection timed out')), 5000);
                 });
-                ws.on('error', (err) => {
-                    console.error(`[Health Check] ❌ ${serviceName} is down. Error: ${err.message}`);
-                    resolve(false);
-                });
-            });
-        } else {
-            // For HTTP services, a fetch to the root is sufficient.
-            // A 404 response still means the service is up and running.
-            const response = await fetch(url);
-            if (response.status < 500) {
-                 console.log(`[Health Check] ✅ ${serviceName} is running at ${url} (status: ${response.status})`);
+                console.log(`[Health Check] ✅ ${serviceName} is running.`);
+                return;
             } else {
-                 console.error(`[Health Check] ❌ ${serviceName} at ${url} responded with server error ${response.status}`);
+                const response = await fetch(url, { timeout: 5000 });
+                if (response.status < 500) {
+                     console.log(`[Health Check] ✅ ${serviceName} is running (status: ${response.status}).`);
+                     return;
+                } else {
+                     throw new Error(`Server responded with status ${response.status}`);
+                }
+            }
+        } catch (error) {
+            console.error(`[Health Check] Attempt ${i} failed for ${serviceName}. Reason: ${error.message}`);
+            if (i < retries) {
+                console.log(`[Health Check] Retrying in ${delay / 1000} seconds...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                console.error(`[Health Check] ❌ FINAL: ${serviceName} at ${url} is unresponsive after ${retries} attempts.`);
             }
         }
-    } catch (error) {
-        console.error(`[Health Check] ❌ ${serviceName} is down at ${url}. Error: ${error.message}`);
     }
 };
 
@@ -163,7 +168,6 @@ const checkAllServices = async () => {
     ]);
     console.log('[Health Check] --- Health checks complete ---');
 };
-
 
 // --- Start Server ---
 server.listen(PORT, () => {

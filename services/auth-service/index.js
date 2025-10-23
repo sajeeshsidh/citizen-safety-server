@@ -17,7 +17,19 @@ const AuthService = {
         app.post('/api/police/login', this.loginPolice);
         app.post('/api/police/pushtoken', this.updatePushToken);
         app.post('/api/firefighter/login', this.loginOrRegisterFirefighter);
-        app.listen(PORT, () => console.log(`Auth Service listening on port ${PORT}`));
+        
+        app.listen(PORT, () => {
+            console.log(`Auth Service listening on port ${PORT}`);
+            // --- Diagnostic Route Logging ---
+            console.log('--- Registered Auth Service Routes ---');
+            app._router.stack.forEach((middleware) => {
+                if (middleware.route) { // routes registered directly on the app
+                    const methods = Object.keys(middleware.route.methods).join(', ').toUpperCase();
+                    console.log(`Route registered: ${methods} ${middleware.route.path}`);
+                }
+            });
+            console.log('------------------------------------');
+        });
     },
 
     async registerCitizen(req, res) {

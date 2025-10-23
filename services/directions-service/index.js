@@ -6,6 +6,7 @@ const polyline = require('@mapbox/polyline');
 
 const PORT = process.env.PORT || 3005;
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+const GOOGLE_API_TIMEOUT_MS = 10000; // 10 seconds
 
 const app = express();
 app.use(cors());
@@ -26,7 +27,7 @@ app.get('/api/route', async (req, res) => {
     const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${origin}&destination=${destination}&key=${GOOGLE_MAPS_API_KEY}`;
 
     try {
-        const response = await fetch(url);
+        const response = await fetch(url, { timeout: GOOGLE_API_TIMEOUT_MS });
         const data = await response.json();
 
         if (data.status !== 'OK' || !data.routes || data.routes.length === 0) {

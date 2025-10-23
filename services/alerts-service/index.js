@@ -8,6 +8,7 @@ const { connect: connectMessageQueue, publish } = require('../../shared/message-
 const PORT = process.env.PORT || 3003;
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3004';
 const AI_ANALYSIS_SERVICE_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://localhost:3007';
+const INTER_SERVICE_TIMEOUT_MS = 55000; // 55 seconds timeout for calls to other services
 
 const app = express();
 app.use(cors());
@@ -58,6 +59,7 @@ const AlertsService = {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message, audioBase64 }),
+                    timeout: INTER_SERVICE_TIMEOUT_MS,
                 });
                 if (aiResponse.ok) {
                     const aiResult = await aiResponse.json();
@@ -75,6 +77,7 @@ const AlertsService = {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ location, category }),
+                timeout: INTER_SERVICE_TIMEOUT_MS,
             });
             const { responderIds: targetedOfficers } = response.ok ? await response.json() : { responderIds: [] };
 
