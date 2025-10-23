@@ -44,15 +44,6 @@ const proxyErrorHandler = (err, req, res, target) => {
     });
 };
 
-console.log("--- API Gateway Configuration ---");
-console.log(`Auth Service -> ${AUTH_SERVICE_URL}`);
-console.log(`Alerts Service -> ${ALERTS_SERVICE_URL}`);
-console.log(`Location Service -> ${LOCATION_SERVICE_URL}`);
-console.log(`Directions Service -> ${DIRECTIONS_SERVICE_URL}`);
-console.log(`WebSocket Service -> ${WEBSOCKET_SERVICE_URL}`);
-console.log(`AI Analysis Service -> ${AI_ANALYSIS_SERVICE_URL}`);
-console.log("---------------------------------");
-
 // Add a simple logging middleware to see all incoming API requests
 app.use('/api', (req, res, next) => {
     console.log(`[API Gateway] Received request: ${req.method} ${req.originalUrl}`);
@@ -67,6 +58,8 @@ const createProxyOptions = (targetUrl, providerName, pathRewriteMap = {}) => ({
     onProxyReq: logProvider(providerName, targetUrl),
     // --- New Error Handler ---
     onError: (err, req, res) => proxyErrorHandler(err, req, res, targetUrl),
+    // Add debug logging to catch internal proxy errors
+    logLevel: 'debug'
 });
 
 // Define the options for each proxy once to avoid duplicating code.
@@ -100,7 +93,7 @@ const aiProxyOptions = createProxyOptions(
 // The order is critical: more specific paths MUST be listed before general paths.
 // **Crucially, we create a NEW proxy instance for each route.**
 
-// 1. Location Service (Handles the most specific '/api/police/*' routes)
+// 1. Location Service (Handles the most specific '/api/police' routes)
 app.use('/api/police/locations', createProxyMiddleware(locationProxyOptions));
 app.use('/api/police/location', createProxyMiddleware(locationProxyOptions));
 
@@ -126,7 +119,62 @@ server.on('upgrade', (req, socket, head) => {
     wsProxy.upgrade(req, socket, head);
 });
 
+// --- Service Health Checks ---
+const checkServiceHealth = async (serviceName, url) => {
+    try {
+        if (url.startsWith('ws')) {
+            // For WebSocket services
+            return new Promise((resolve) => {
+                const ws = new WebSocket(url);
+                ws.on('open', () => {
+                    console.log(`[Health Check] ✅ ${serviceName} is running at ${url}`);
+                    ws.close();
+                    resolve(true);
+                });
+                ws.on('error', (err) => {
+                    console.error(`[Health Check] ❌ ${serviceName} is down. Error: ${err.message}`);
+                    resolve(false);
+                });
+            });
+        } else {
+            // For HTTP services, a fetch to the root is sufficient.
+            // A 404 response still means the service is up and running.
+            const response = await fetch(url);
+            if (response.status < 500) {
+                 console.log(`[Health Check] ✅ ${serviceName} is running at ${url} (status: ${response.status})`);
+            } else {
+                 console.error(`[Health Check] ❌ ${serviceName} at ${url} responded with server error ${response.status}`);
+            }
+        }
+    } catch (error) {
+        console.error(`[Health Check] ❌ ${serviceName} is down at ${url}. Error: ${error.message}`);
+    }
+};
+
+const checkAllServices = async () => {
+    console.log('[Health Check] --- Starting microservice health checks ---');
+    await Promise.all([
+        checkServiceHealth('Auth Service', AUTH_SERVICE_URL),
+        checkServiceHealth('Alerts Service', ALERTS_SERVICE_URL),
+        checkServiceHealth('Location Service', LOCATION_SERVICE_URL),
+        checkServiceHealth('Directions Service', DIRECTIONS_SERVICE_URL),
+        checkServiceHealth('AI Analysis Service', AI_ANALYSIS_SERVICE_URL),
+        checkServiceHealth('WebSocket Service', WEBSOCKET_SERVICE_URL)
+    ]);
+    console.log('[Health Check] --- Health checks complete ---');
+};
+
+
 // --- Start Server ---
 server.listen(PORT, () => {
     console.log(`API Gateway is listening on port ${PORT}`);
+    console.log(`Proxying AUTH requests to: ${AUTH_SERVICE_URL}`);
+    console.log(`Proxying ALERTS requests to: ${ALERTS_SERVICE_URL}`);
+    console.log(`Proxying LOCATION requests to: ${LOCATION_SERVICE_URL}`);
+    console.log(`Proxying DIRECTIONS requests to: ${DIRECTIONS_SERVICE_URL}`);
+    console.log(`Proxying AI requests to: ${AI_ANALYSIS_SERVICE_URL}`);
+    console.log(`Proxying WebSocket connections to: ${WEBSOCKET_SERVICE_URL}`);
+
+    // Run health checks on startup
+    checkAllServices();
 });
