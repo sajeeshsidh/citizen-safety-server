@@ -50,50 +50,52 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
-// --- Reverse Proxy Middleware Instances ---
-const authProxy = createProxyMiddleware({ 
+// --- Proxy Options ---
+// Define the options for each proxy once to avoid duplicating code.
+const authProxyOptions = { 
     target: AUTH_SERVICE_URL, 
     changeOrigin: true,
     onProxyReq: logProvider('AuthService', AUTH_SERVICE_URL)
-});
-const alertsProxy = createProxyMiddleware({ 
+};
+const alertsProxyOptions = { 
     target: ALERTS_SERVICE_URL, 
     changeOrigin: true,
     onProxyReq: logProvider('AlertsService', ALERTS_SERVICE_URL)
-});
-const locationProxy = createProxyMiddleware({ 
+};
+const locationProxyOptions = { 
     target: LOCATION_SERVICE_URL, 
     changeOrigin: true,
     onProxyReq: logProvider('LocationService', LOCATION_SERVICE_URL)
-});
-const directionsProxy = createProxyMiddleware({ 
+};
+const directionsProxyOptions = { 
     target: DIRECTIONS_SERVICE_URL, 
     changeOrigin: true,
     onProxyReq: logProvider('DirectionsService', DIRECTIONS_SERVICE_URL)
-});
-const aiProxy = createProxyMiddleware({ 
+};
+const aiProxyOptions = { 
     target: AI_ANALYSIS_SERVICE_URL, 
     changeOrigin: true,
     onProxyReq: logProvider('AIService', AI_ANALYSIS_SERVICE_URL)
-});
+};
 
 
 // --- Routing Order ---
 // The order is critical: more specific paths MUST be listed before general paths.
+// **Crucially, we create a NEW proxy instance for each route.**
 
 // 1. Location Service (Handles the most specific '/api/police/*' routes)
-app.use('/api/police/locations', locationProxy);
-app.use('/api/police/location', locationProxy);
+app.use('/api/police/locations', createProxyMiddleware(locationProxyOptions));
+app.use('/api/police/location', createProxyMiddleware(locationProxyOptions));
 
 // 2. Auth Service (Handles all other auth-related routes)
-app.use('/api/citizen', authProxy);
-app.use('/api/police', authProxy); // This is now safe because specific police routes were handled above
-app.use('/api/firefighter', authProxy);
+app.use('/api/citizen', createProxyMiddleware(authProxyOptions));
+app.use('/api/police', createProxyMiddleware(authProxyOptions)); // Safe because specific police routes were handled above
+app.use('/api/firefighter', createProxyMiddleware(authProxyOptions));
 
 // 3. Other Services
-app.use('/api/alerts', alertsProxy);
-app.use('/api/route', directionsProxy);
-app.use('/api/internal/analyze', aiProxy);
+app.use('/api/alerts', createProxyMiddleware(alertsProxyOptions));
+app.use('/api/route', createProxyMiddleware(directionsProxyOptions));
+app.use('/api/internal/analyze', createProxyMiddleware(aiProxyOptions));
 
 // --- WebSocket Proxying ---
 server.on('upgrade', (req, socket, head) => {
