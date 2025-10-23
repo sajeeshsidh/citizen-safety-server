@@ -35,6 +35,15 @@ const logProvider = (providerName, target) => {
     };
 };
 
+// --- Error logging ---
+const proxyErrorHandler = (err, req, res, target) => {
+    console.error(`[API Gateway] Failed to connect to ${target} for ${req.originalUrl}:`, err.code);
+    res.status(503).json({
+        message: `Service Unavailable: Could not reach the back-end service at ${target}`,
+        code: err.code
+    });
+};
+
 console.log("--- API Gateway Configuration ---");
 console.log(`Auth Service -> ${AUTH_SERVICE_URL}`);
 console.log(`Alerts Service -> ${ALERTS_SERVICE_URL}`);
@@ -51,33 +60,41 @@ app.use('/api', (req, res, next) => {
 });
 
 // --- Proxy Options ---
-// Define the options for each proxy once to avoid duplicating code.
-const authProxyOptions = { 
-    target: AUTH_SERVICE_URL, 
+const createProxyOptions = (targetUrl, providerName, pathRewriteMap = {}) => ({
+    target: targetUrl,
     changeOrigin: true,
-    onProxyReq: logProvider('AuthService', AUTH_SERVICE_URL)
-};
-const alertsProxyOptions = { 
-    target: ALERTS_SERVICE_URL, 
-    changeOrigin: true,
-    onProxyReq: logProvider('AlertsService', ALERTS_SERVICE_URL)
-};
-const locationProxyOptions = { 
-    target: LOCATION_SERVICE_URL, 
-    changeOrigin: true,
-    onProxyReq: logProvider('LocationService', LOCATION_SERVICE_URL)
-};
-const directionsProxyOptions = { 
-    target: DIRECTIONS_SERVICE_URL, 
-    changeOrigin: true,
-    onProxyReq: logProvider('DirectionsService', DIRECTIONS_SERVICE_URL)
-};
-const aiProxyOptions = { 
-    target: AI_ANALYSIS_SERVICE_URL, 
-    changeOrigin: true,
-    onProxyReq: logProvider('AIService', AI_ANALYSIS_SERVICE_URL)
-};
+    pathRewrite: pathRewriteMap,
+    onProxyReq: logProvider(providerName, targetUrl),
+    // --- New Error Handler ---
+    onError: (err, req, res) => proxyErrorHandler(err, req, res, targetUrl),
+});
 
+// Define the options for each proxy once to avoid duplicating code.
+const authProxyOptions = createProxyOptions(
+    AUTH_SERVICE_URL,
+    'AuthService',
+    {}
+);
+const alertsProxyOptions = createProxyOptions(
+    ALERTS_SERVICE_URL,
+    'AlertsService',
+    {}
+);
+const locationProxyOptions = createProxyOptions(
+    LOCATION_SERVICE_URL,
+    'LocationService',
+    {}
+);
+const directionsProxyOptions = createProxyOptions(
+    DIRECTIONS_SERVICE_URL,
+    'DirectionsService',
+    {}
+);
+const aiProxyOptions = createProxyOptions(
+    AI_ANALYSIS_SERVICE_URL,
+    'AIService',
+    {}
+);
 
 // --- Routing Order ---
 // The order is critical: more specific paths MUST be listed before general paths.
