@@ -28,6 +28,13 @@ app.get('/', (req, res) => {
     res.send('API Gateway is running.');
 });
 
+// --- Diagnostic Logging ---
+const logProvider = (providerName, target) => {
+    return (proxyReq, req, res) => {
+        console.log(`[API Gateway] Proxying request ${req.method} ${req.originalUrl} to ${providerName} at ${target}`);
+    };
+};
+
 console.log("--- API Gateway Configuration ---");
 console.log(`Auth Service -> ${AUTH_SERVICE_URL}`);
 console.log(`Alerts Service -> ${ALERTS_SERVICE_URL}`);
@@ -37,43 +44,76 @@ console.log(`WebSocket Service -> ${WEBSOCKET_SERVICE_URL}`);
 console.log(`AI Analysis Service -> ${AI_ANALYSIS_SERVICE_URL}`);
 console.log("---------------------------------");
 
+// Add a simple logging middleware to see all incoming API requests
+app.use('/api', (req, res, next) => {
+    console.log(`[API Gateway] Received request: ${req.method} ${req.originalUrl}`);
+    next();
+});
 
 // --- Reverse Proxy Routing ---
 // The order of these routes is crucial. More specific routes must come before general ones.
 
-// 1. Location Service Routes (very specific)
-app.use('/api/police/locations', createProxyMiddleware({ target: LOCATION_SERVICE_URL, changeOrigin: true }));
-app.use('/api/police/location', createProxyMiddleware({ target: LOCATION_SERVICE_URL, changeOrigin: true }));
+// 1. Location Service Routes (most specific)
+app.use('/api/police/locations', createProxyMiddleware({
+    target: LOCATION_SERVICE_URL,
+    changeOrigin: true,
+    onProxyReq: logProvider('LocationService', LOCATION_SERVICE_URL)
+}));
+app.use('/api/police/location', createProxyMiddleware({
+    target: LOCATION_SERVICE_URL,
+    changeOrigin: true,
+    onProxyReq: logProvider('LocationService', LOCATION_SERVICE_URL)
+}));
 
-// 2. Auth Service Routes (all other citizen, police, firefighter routes)
-app.use('/api/citizen', createProxyMiddleware({ target: AUTH_SERVICE_URL, changeOrigin: true }));
-app.use('/api/police', createProxyMiddleware({ target: AUTH_SERVICE_URL, changeOrigin: true })); // Catches /register, /login, /pushtoken
-app.use('/api/firefighter', createProxyMiddleware({ target: AUTH_SERVICE_URL, changeOrigin: true }));
+// 2. Auth Service Routes
+app.use('/api/citizen', createProxyMiddleware({
+    target: AUTH_SERVICE_URL,
+    changeOrigin: true,
+    onProxyReq: logProvider('AuthService', AUTH_SERVICE_URL)
+}));
+app.use('/api/police', createProxyMiddleware({
+    target: AUTH_SERVICE_URL,
+    changeOrigin: true,
+    onProxyReq: logProvider('AuthService', AUTH_SERVICE_URL)
+}));
+app.use('/api/firefighter', createProxyMiddleware({
+    target: AUTH_SERVICE_URL,
+    changeOrigin: true,
+    onProxyReq: logProvider('AuthService', AUTH_SERVICE_URL)
+}));
 
 // 3. Alerts Service Routes
-app.use('/api/alerts', createProxyMiddleware({ target: ALERTS_SERVICE_URL, changeOrigin: true }));
+app.use('/api/alerts', createProxyMiddleware({
+    target: ALERTS_SERVICE_URL,
+    changeOrigin: true,
+    onProxyReq: logProvider('AlertsService', ALERTS_SERVICE_URL)
+}));
 
 // 4. Directions Service Routes
-app.use('/api/route', createProxyMiddleware({ target: DIRECTIONS_SERVICE_URL, changeOrigin: true }));
+app.use('/api/route', createProxyMiddleware({
+    target: DIRECTIONS_SERVICE_URL,
+    changeOrigin: true,
+    onProxyReq: logProvider('DirectionsService', DIRECTIONS_SERVICE_URL)
+}));
 
-// 5. AI Service (Internal) - While not directly called from the client, routing it can be useful for testing.
-app.use('/api/internal/analyze', createProxyMiddleware({ target: AI_ANALYSIS_SERVICE_URL, changeOrigin: true }));
-
+// 5. AI Service (Internal)
+app.use('/api/internal/analyze', createProxyMiddleware({
+    target: AI_ANALYSIS_SERVICE_URL,
+    changeOrigin: true,
+    onProxyReq: logProvider('AIService', AI_ANALYSIS_SERVICE_URL)
+}));
 
 // --- WebSocket Proxying ---
-// This special handler listens for the initial HTTP 'upgrade' request that starts a WebSocket connection.
 server.on('upgrade', (req, socket, head) => {
-  console.log('Proxying WebSocket upgrade request...');
-  // Create a proxy specifically for WebSocket connections.
-  const wsProxy = createProxyMiddleware({
-    target: WEBSOCKET_SERVICE_URL,
-    ws: true, // Enable WebSocket proxying
-    changeOrigin: true
-  });
-  // Manually call the upgrade method from the proxy middleware.
-  wsProxy.upgrade(req, socket, head);
+    console.log('[API Gateway] Attempting to upgrade WebSocket connection...');
+    const wsProxy = createProxyMiddleware({
+        target: WEBSOCKET_SERVICE_URL,
+        ws: true,
+        changeOrigin: true,
+        logLevel: 'debug' // More verbose logging for websockets
+    });
+    wsProxy.upgrade(req, socket, head);
 });
-
 
 // --- Start Server ---
 server.listen(PORT, () => {
