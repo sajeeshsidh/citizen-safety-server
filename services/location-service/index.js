@@ -29,24 +29,36 @@ function getHaversineDistance(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Finds all police officers within a predefined radius of a location.
+ * Finds all responders of a specific category within a radius of a location.
  * @param {{ lat: number, lng: number }} location - The center point of the search.
- * @returns {Promise<string[]>} A promise that resolves with an array of officer badge numbers.
+ * @param {string} category - The category of emergency (e.g., 'Law & Order', 'Fire & Rescue').
+ * @returns {Promise<string[]>} A promise that resolves with an array of responder IDs.
  */
-async function findNearbyOfficersFunction(location) {
+async function findNearbyResponders(location, category) {
     const db = getDb();
-    const allOfficers = await db.all('SELECT badgeNumber, locationLat, locationLng FROM police WHERE locationLat IS NOT NULL');
-    const nearbyOfficerIds = [];
-    for (const officer of allOfficers) {
+    let responders = [];
+
+    // Query the appropriate table based on the category
+    if (category === 'Law & Order') {
+        responders = await db.all('SELECT badgeNumber as id, locationLat, locationLng FROM police WHERE locationLat IS NOT NULL');
+    } else if (category === 'Fire & Rescue') {
+        responders = await db.all('SELECT unitNumber as id, locationLat, locationLng FROM firefighters WHERE locationLat IS NOT NULL');
+    } else {
+        // Default to searching police if category is unknown
+        responders = await db.all('SELECT badgeNumber as id, locationLat, locationLng FROM police WHERE locationLat IS NOT NULL');
+    }
+
+    const nearbyResponderIds = [];
+    for (const responder of responders) {
         const distance = getHaversineDistance(
             location.lat, location.lng,
-            officer.locationLat, officer.locationLng
+            responder.locationLat, responder.locationLng
         );
         if (distance <= SEARCH_RADIUS_KM) {
-            nearbyOfficerIds.push(officer.badgeNumber);
+            nearbyResponderIds.push(responder.id);
         }
     }
-    return nearbyOfficerIds;
+    return nearbyResponderIds;
 }
 
 const LocationService = {
@@ -60,16 +72,17 @@ const LocationService = {
 
         // Internal API for service-to-service communication
         app.post('/api/internal/find-nearby', async (req, res) => {
-            const { location } = req.body;
+            const { location, category } = req.body;
             if (!location || typeof location.lat !== 'number' || typeof location.lng !== 'number') {
                 return res.status(400).json({ message: 'A valid location object is required.' });
             }
             try {
-                const officerIds = await findNearbyOfficersFunction(location);
-                res.status(200).json({ officerIds });
+                // Use the category to find the right type of responders
+                const responderIds = await findNearbyResponders(location, category || 'Law & Order');
+                res.status(200).json({ responderIds });
             } catch (error) {
                 console.error('Internal find-nearby error:', error);
-                res.status(500).json({ message: 'Failed to query for nearby officers.' });
+                res.status(500).json({ message: 'Failed to query for nearby responders.' });
             }
         });
 

@@ -33,7 +33,15 @@ async function setupDatabase() {
             phoneNumber TEXT NOT NULL,
             pushToken TEXT,
             locationLat REAL,
-            locationLng REAL
+            locationLng REAL,
+            department TEXT DEFAULT 'Law & Order'
+        );
+        CREATE TABLE IF NOT EXISTS firefighters (
+            unitNumber TEXT PRIMARY KEY,
+            pushToken TEXT,
+            locationLat REAL,
+            locationLng REAL,
+            department TEXT DEFAULT 'Fire & Rescue'
         );
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +52,7 @@ async function setupDatabase() {
             locationLng REAL,
             timestamp INTEGER NOT NULL,
             status TEXT NOT NULL,
+            category TEXT,
             acceptedBy TEXT,
             searchRadius INTEGER,
             timeoutTimestamp INTEGER,
@@ -61,12 +70,16 @@ async function setupDatabase() {
     if (!alertsColumnNames.includes('searchRadius')) await db.exec('ALTER TABLE alerts ADD COLUMN searchRadius INTEGER');
     if (!alertsColumnNames.includes('timeoutTimestamp')) await db.exec('ALTER TABLE alerts ADD COLUMN timeoutTimestamp INTEGER');
     if (!alertsColumnNames.includes('targetedOfficers')) await db.exec('ALTER TABLE alerts ADD COLUMN targetedOfficers TEXT');
+    if (!alertsColumnNames.includes('category')) await db.exec('ALTER TABLE alerts ADD COLUMN category TEXT');
+
 
     const policeInfo = await db.all("PRAGMA table_info(police)");
     const policeColumnNames = policeInfo.map(col => col.name);
     if (!policeColumnNames.includes('pushToken')) await db.exec('ALTER TABLE police ADD COLUMN pushToken TEXT');
     if (!policeColumnNames.includes('locationLat')) await db.exec('ALTER TABLE police ADD COLUMN locationLat REAL');
     if (!policeColumnNames.includes('locationLng')) await db.exec('ALTER TABLE police ADD COLUMN locationLng REAL');
+    if (!policeColumnNames.includes('department')) await db.exec("ALTER TABLE police ADD COLUMN department TEXT DEFAULT 'Law & Order'");
+
 
     console.log('Database connected and tables ensured.');
     return db;

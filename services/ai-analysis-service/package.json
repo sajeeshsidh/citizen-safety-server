@@ -1,0 +1,14 @@
+{
+  "name": "ai-analysis-service",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "@google/genai": "^0.14.0"
+  }
+}

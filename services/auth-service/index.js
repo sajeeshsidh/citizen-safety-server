@@ -16,6 +16,7 @@ const AuthService = {
         app.post('/api/police/register', this.registerPolice);
         app.post('/api/police/login', this.loginPolice);
         app.post('/api/police/pushtoken', this.updatePushToken);
+        app.post('/api/firefighter/login', this.loginOrRegisterFirefighter);
         app.listen(PORT, () => console.log(`Auth Service listening on port ${PORT}`));
     },
 
@@ -54,15 +55,15 @@ const AuthService = {
     },
 
     async registerPolice(req, res) {
-        const { name, designation, badgeNumber, phoneNumber } = req.body;
+        const { name, designation, badgeNumber, phoneNumber, department } = req.body;
         if (!name || !designation || !badgeNumber || !phoneNumber) {
             return res.status(400).json({ message: 'All fields are required for police registration.' });
         }
         try {
             const db = getDb();
             await db.run(
-                'INSERT INTO police (name, designation, badgeNumber, phoneNumber) VALUES (?, ?, ?, ?)',
-                name, designation, badgeNumber, phoneNumber
+                'INSERT INTO police (name, designation, badgeNumber, phoneNumber, department) VALUES (?, ?, ?, ?, ?)',
+                name, designation, badgeNumber, phoneNumber, department || 'Law & Order'
             );
             res.status(201).json({ name, designation, badgeNumber, phoneNumber });
         } catch (error) {
@@ -87,6 +88,26 @@ const AuthService = {
         } catch (error) {
             console.error('Error logging in police:', error);
             res.status(500).json({ message: 'Police login failed.' });
+        }
+    },
+
+    async loginOrRegisterFirefighter(req, res) {
+        const { unitNumber } = req.body;
+        if (!unitNumber) {
+            return res.status(400).json({ message: 'Unit number is required.' });
+        }
+        try {
+            const db = getDb();
+            let firefighter = await db.get('SELECT * FROM firefighters WHERE unitNumber = ?', unitNumber);
+            if (!firefighter) {
+                // Auto-register if not found for demo purposes
+                await db.run('INSERT INTO firefighters (unitNumber, department) VALUES (?, ?)', unitNumber, 'Fire & Rescue');
+                firefighter = await db.get('SELECT * FROM firefighters WHERE unitNumber = ?', unitNumber);
+            }
+            res.json(firefighter);
+        } catch (error) {
+            console.error('Error logging in/registering firefighter:', error);
+            res.status(500).json({ message: 'Firefighter login failed.' });
         }
     },
 
