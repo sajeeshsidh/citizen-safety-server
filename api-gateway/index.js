@@ -50,58 +50,50 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
-// --- Reverse Proxy Routing ---
-// The order of these routes is crucial. More specific routes must come before general ones.
-
-// 1. Location Service Routes (most specific)
-app.use('/api/police/locations', createProxyMiddleware({
-    target: LOCATION_SERVICE_URL,
-    changeOrigin: true,
-    onProxyReq: logProvider('LocationService', LOCATION_SERVICE_URL)
-}));
-app.use('/api/police/location', createProxyMiddleware({
-    target: LOCATION_SERVICE_URL,
-    changeOrigin: true,
-    onProxyReq: logProvider('LocationService', LOCATION_SERVICE_URL)
-}));
-
-// 2. Auth Service Routes
-app.use('/api/citizen', createProxyMiddleware({
-    target: AUTH_SERVICE_URL,
+// --- Reverse Proxy Middleware Instances ---
+const authProxy = createProxyMiddleware({ 
+    target: AUTH_SERVICE_URL, 
     changeOrigin: true,
     onProxyReq: logProvider('AuthService', AUTH_SERVICE_URL)
-}));
-app.use('/api/police', createProxyMiddleware({
-    target: AUTH_SERVICE_URL,
-    changeOrigin: true,
-    onProxyReq: logProvider('AuthService', AUTH_SERVICE_URL)
-}));
-app.use('/api/firefighter', createProxyMiddleware({
-    target: AUTH_SERVICE_URL,
-    changeOrigin: true,
-    onProxyReq: logProvider('AuthService', AUTH_SERVICE_URL)
-}));
-
-// 3. Alerts Service Routes
-app.use('/api/alerts', createProxyMiddleware({
-    target: ALERTS_SERVICE_URL,
+});
+const alertsProxy = createProxyMiddleware({ 
+    target: ALERTS_SERVICE_URL, 
     changeOrigin: true,
     onProxyReq: logProvider('AlertsService', ALERTS_SERVICE_URL)
-}));
-
-// 4. Directions Service Routes
-app.use('/api/route', createProxyMiddleware({
-    target: DIRECTIONS_SERVICE_URL,
+});
+const locationProxy = createProxyMiddleware({ 
+    target: LOCATION_SERVICE_URL, 
+    changeOrigin: true,
+    onProxyReq: logProvider('LocationService', LOCATION_SERVICE_URL)
+});
+const directionsProxy = createProxyMiddleware({ 
+    target: DIRECTIONS_SERVICE_URL, 
     changeOrigin: true,
     onProxyReq: logProvider('DirectionsService', DIRECTIONS_SERVICE_URL)
-}));
-
-// 5. AI Service (Internal)
-app.use('/api/internal/analyze', createProxyMiddleware({
-    target: AI_ANALYSIS_SERVICE_URL,
+});
+const aiProxy = createProxyMiddleware({ 
+    target: AI_ANALYSIS_SERVICE_URL, 
     changeOrigin: true,
     onProxyReq: logProvider('AIService', AI_ANALYSIS_SERVICE_URL)
-}));
+});
+
+
+// --- Routing Order ---
+// The order is critical: more specific paths MUST be listed before general paths.
+
+// 1. Location Service (Handles the most specific '/api/police/*' routes)
+app.use('/api/police/locations', locationProxy);
+app.use('/api/police/location', locationProxy);
+
+// 2. Auth Service (Handles all other auth-related routes)
+app.use('/api/citizen', authProxy);
+app.use('/api/police', authProxy); // This is now safe because specific police routes were handled above
+app.use('/api/firefighter', authProxy);
+
+// 3. Other Services
+app.use('/api/alerts', alertsProxy);
+app.use('/api/route', directionsProxy);
+app.use('/api/internal/analyze', aiProxy);
 
 // --- WebSocket Proxying ---
 server.on('upgrade', (req, socket, head) => {
