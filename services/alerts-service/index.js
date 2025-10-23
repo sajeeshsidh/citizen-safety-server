@@ -7,6 +7,7 @@ const { connect: connectMessageQueue, publish } = require('../../shared/message-
 
 const PORT = process.env.PORT || 3003;
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3004';
+const AI_ANALYSIS_SERVICE_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://localhost:3007';
 
 const app = express();
 app.use(cors());
@@ -50,35 +51,50 @@ const AlertsService = {
             return res.status(400).json({ message: 'Citizen ID and location are required.' });
         }
         try {
-            // 1. Find nearby officers via an HTTP call to the Location Service.
+            // 1. Call the AI Analysis service to get the emergency category.
+            let category = 'Law & Order'; // Default category
+            try {
+                const aiResponse = await fetch(`${AI_ANALYSIS_SERVICE_URL}/api/internal/analyze`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message, audioBase64 }),
+                });
+                if (aiResponse.ok) {
+                    const aiResult = await aiResponse.json();
+                    category = aiResult.category;
+                    console.log(`[Alerts] AI analysis result: ${category}`);
+                } else {
+                    console.warn('[Alerts] AI analysis failed, using default category.');
+                }
+            } catch (aiError) {
+                console.error('[Alerts] Error calling AI service, using default category:', aiError);
+            }
+
+            // 2. Find nearby responders via an HTTP call to the Location Service, now with a category.
             const response = await fetch(`${LOCATION_SERVICE_URL}/api/internal/find-nearby`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ location }),
+                body: JSON.stringify({ location, category }),
             });
-            const { officerIds: targetedOfficers } = response.ok ? await response.json() : { officerIds: [] };
+            const { responderIds: targetedOfficers } = response.ok ? await response.json() : { responderIds: [] };
 
-            // 2. Save the new alert to the database.
+            // 3. Save the new alert to the database with the category.
             const db = getDb();
             const timestamp = Date.now();
             const newAlertData = {
                 citizenId, message, audioBase64,
                 locationLat: location.lat, locationLng: location.lng,
-                timestamp, status: 'new',
+                timestamp, status: 'new', category,
                 targetedOfficers: JSON.stringify(targetedOfficers),
                 timeoutTimestamp: timestamp + (30 * 1000), // 30 second timeout
             };
             const result = await db.run(
-                'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, targetedOfficers, timeoutTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [
-                    newAlertData.citizenId, newAlertData.message, newAlertData.audioBase64,
-                    newAlertData.locationLat, newAlertData.locationLng, newAlertData.timestamp,
-                    newAlertData.status, newAlertData.targetedOfficers, newAlertData.timeoutTimestamp
-                ]
+                'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, category, targetedOfficers, timeoutTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                Object.values(newAlertData)
             );
             const createdAlert = { id: result.lastID, ...newAlertData };
 
-            // 3. Publish events to the message queue.
+            // 4. Publish events to the message queue.
             publish('alert.created', JSON.stringify({ targetedOfficers, alert: createdAlert }));
             publish('alert.broadcast', JSON.stringify({ message: 'New alert created' }));
             res.status(201).json(AlertsService._formatAlert(createdAlert));
@@ -147,7 +163,7 @@ const AlertsService = {
             try {
                 newAlert.targetedOfficers = JSON.parse(newAlert.targetedOfficers);
             } catch (e) {
-                console.error("Error in parsing JSON response for targetOfficers", e);
+                console.error('JSON parsing failed for targetOfficers', e);
                 newAlert.targetedOfficers = [];
             }
         }

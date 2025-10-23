@@ -12,6 +12,7 @@ const ALERTS_SERVICE_URL = process.env.ALERTS_SERVICE_URL || 'http://localhost:3
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3004';
 const DIRECTIONS_SERVICE_URL = process.env.DIRECTIONS_SERVICE_URL || 'http://localhost:3005';
 const WEBSOCKET_SERVICE_URL = process.env.WEBSOCKET_SERVICE_URL || 'ws://localhost:3006';
+const AI_ANALYSIS_SERVICE_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://localhost:3007';
 
 const PORT = process.env.PORT || 3001;
 
@@ -31,8 +32,13 @@ app.get('/', (req, res) => {
 // The gateway forwards requests to the appropriate microservice.
 app.use('/api/citizen', createProxyMiddleware({ target: AUTH_SERVICE_URL, changeOrigin: true, pathRewrite: { '^/api': '/api' } }));
 app.use('/api/police', createProxyMiddleware({ target: AUTH_SERVICE_URL, changeOrigin: true, pathRewrite: { '^/api': '/api' } }));
+app.use('/api/firefighter', createProxyMiddleware({ target: AUTH_SERVICE_URL, changeOrigin: true, pathRewrite: { '^/api': '/api' } }));
 app.use('/api/alerts', createProxyMiddleware({ target: ALERTS_SERVICE_URL, changeOrigin: true, pathRewrite: { '^/api': '/api' } }));
 app.use('/api/route', createProxyMiddleware({ target: DIRECTIONS_SERVICE_URL, changeOrigin: true, pathRewrite: { '^/api': '/api' } }));
+// Internal services are also routed
+app.use('/api/internal/analyze', createProxyMiddleware({ target: AI_ANALYSIS_SERVICE_URL, changeOrigin: true, pathRewrite: { '^/api/internal': '/api/internal' } }));
+app.use('/api/internal/find-nearby', createProxyMiddleware({ target: LOCATION_SERVICE_URL, changeOrigin: true, pathRewrite: { '^/api/internal': '/api/internal' } }));
+
 // The location service has both public and internal endpoints that can be proxied.
 app.use('/api/police/locations', createProxyMiddleware({ target: LOCATION_SERVICE_URL, changeOrigin: true, pathRewrite: { '^/api': '/api' } }));
 app.use('/api/police/location', createProxyMiddleware({ target: LOCATION_SERVICE_URL, changeOrigin: true, pathRewrite: { '^/api': '/api' } }));
@@ -58,5 +64,6 @@ server.listen(PORT, () => {
     console.log(`Proxying ALERTS requests to: ${ALERTS_SERVICE_URL}`);
     console.log(`Proxying LOCATION requests to: ${LOCATION_SERVICE_URL}`);
     console.log(`Proxying DIRECTIONS requests to: ${DIRECTIONS_SERVICE_URL}`);
+    console.log(`Proxying AI requests to: ${AI_ANALYSIS_SERVICE_URL}`);
     console.log(`Proxying WebSocket connections to: ${WEBSOCKET_SERVICE_URL}`);
 });
