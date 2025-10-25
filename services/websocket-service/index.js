@@ -31,8 +31,12 @@ const WebSocketService = {
 
         wss.on('connection', this.handleConnection);
 
-        // Subscribe to broadcast events from other services.
-        subscribe('alert.broadcast', () => this.broadcastAlerts());
+        // Subscribe to all alert events with a wildcard for geohash.
+        subscribe('alert.created.*', (msg) => this.routeAlertToSubscribers(msg, 'alert_created'));
+        subscribe('alert.updated.*', (msg) => this.routeAlertToSubscribers(msg, 'alert_updated'));
+        subscribe('alert.deleted.*', (msg) => this.routeAlertToSubscribers(msg, 'alert_deleted'));
+
+        // Keep location broadcast for now as it's global for officers
         subscribe('location.broadcast', () => this.broadcastLocations());
 
         server.listen(PORT, () => console.log(`WebSocket Service listening on port ${PORT}`));
@@ -41,16 +45,29 @@ const WebSocketService = {
 
     handleConnection(ws) {
         console.log('[WS] Client connected.');
+        clientMetadata.set(ws, { topics: new Set() }); // Initialize with empty subscriptions
 
         ws.on('message', (message) => {
             try {
                 const data = JSON.parse(message);
-                if (data.type === 'auth') {
-                    console.log(`[WS] Auth message received for user: ${data.payload.mobile}`);
-                    // Associate the user's details with their connection.
-                    clientMetadata.set(ws, { role: data.payload.role, mobile: data.payload.mobile });
-                    // Send the initial data set upon successful authentication.
-                    WebSocketService.broadcastAlerts();
+                const metadata = clientMetadata.get(ws);
+                if (!metadata) return;
+
+                switch(data.type) {
+                    case 'auth':
+                        console.log(`[WS] Auth message received for user: ${data.payload.mobile}`);
+                        metadata.role = data.payload.role;
+                        metadata.mobile = data.payload.mobile;
+                        break;
+                    case 'subscribe':
+                        data.payload.topics.forEach(topic => metadata.topics.add(topic));
+                        console.log(`[WS] Client subscribed to: ${data.payload.topics.join(', ')}`);
+                        WebSocketService.sendInitialAlerts(ws, data.payload.topics);
+                        break;
+                    case 'unsubscribe':
+                         data.payload.topics.forEach(topic => metadata.topics.delete(topic));
+                        console.log(`[WS] Client unsubscribed from: ${data.payload.topics.join(', ')}`);
+                        break;
                 }
             } catch (error) {
                 console.error('[WS] Error parsing message:', error);
@@ -63,21 +80,55 @@ const WebSocketService = {
         });
     },
 
-    async broadcastAlerts() {
+    async sendInitialAlerts(ws, topics) {
+        if (!topics || topics.length === 0) return;
+
+        const geohashes = topics.map(topic => topic.replace('geo:', ''));
         try {
-            const allAlerts = await dbService.request('/alerts');
-            console.log(`[WS] Broadcasting alerts to ${wss.clients.size} clients.`);
-            const message = JSON.stringify({ type: 'alerts', payload: allAlerts });
-            for (const client of wss.clients) {
-                if (client.readyState === 1) { // WebSocket.OPEN
-                    client.send(message);
-                }
+            const alerts = await dbService.request('/alerts/by-geohashes', {
+                method: 'POST',
+                body: JSON.stringify({ geohashes })
+            });
+            // FIX: Always send an initial_alerts message, even if the payload is empty.
+            // This initializes the client's state correctly and prevents race conditions.
+            // The previous logic failed to send a message if 'alerts' was null or empty.
+            ws.send(JSON.stringify({ type: 'initial_alerts', payload: alerts || [] }));
+            if (alerts && alerts.length > 0) {
+                 console.log(`[WS] Sent ${alerts.length} initial alerts to newly subscribed client.`);
+            } else {
+                 console.log(`[WS] Sent 0 initial alerts to newly subscribed client.`);
             }
-        } catch (error) {
-            console.error('[WS] Failed to fetch and broadcast alerts:', error);
+        } catch(e) {
+            console.error('[WS] Failed to fetch initial alerts for subscriber:', e);
         }
     },
 
+    routeAlertToSubscribers(msg, messageType) {
+        try {
+            const routingKey = msg.fields.routingKey;
+            const geohash = routingKey.split('.').pop();
+            const topic = `geo:${geohash}`;
+            const alertPayload = JSON.parse(msg.content.toString());
+
+            const message = JSON.stringify({ type: messageType, payload: alertPayload });
+            let clientSentCount = 0;
+
+            for (const client of wss.clients) {
+                const metadata = clientMetadata.get(client);
+                if (client.readyState === 1 && metadata?.topics.has(topic)) {
+                    client.send(message);
+                    clientSentCount++;
+                }
+            }
+            if(clientSentCount > 0) {
+                console.log(`[WS] Routed ${messageType} for alert #${alertPayload.id} to ${clientSentCount} clients subscribed to ${topic}.`);
+            }
+        } catch(e) {
+            console.error(`[WS] Error routing message of type ${messageType}:`, e);
+        }
+    },
+
+    // This is a global broadcast and not geo-targeted, which is fine for officer locations for now.
     async broadcastLocations() {
         try {
             const officers = await dbService.request('/police');

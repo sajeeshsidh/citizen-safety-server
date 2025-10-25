@@ -13,7 +13,7 @@ const DatabaseService = {
         if (!alert) return null;
         const newAlert = { ...alert };
         if (newAlert.targetedOfficers) {
-            try { newAlert.targetedOfficers = JSON.parse(newAlert.targetedOfficers); } catch (e) { newAlert.targetedOfficers = []; }
+            try { newAlert.targetedOfficers = JSON.parse(newAlert.targetedOfficers); } catch (e) { newAlert.targetedOfficers = []; console.log("JSON Parse error", e); }
         }
         if (newAlert.locationLat && newAlert.locationLng) {
             newAlert.location = { lat: newAlert.locationLat, lng: newAlert.locationLng };
@@ -30,29 +30,44 @@ const DatabaseService = {
         app.get('/', (req, res) => res.send('Database Service is running.'));
 
         // --- ALERTS API ---
+
         app.get('/alerts', async (req, res) => {
             const alertsRaw = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
             res.json(alertsRaw.map(this._formatAlert));
         });
 
+        app.get('/alerts/:id', async (req, res) => {
+            const alertRaw = await db.get('SELECT * FROM alerts WHERE id = ?', req.params.id);
+            res.json(this._formatAlert(alertRaw));
+        });
+
+        app.post('/alerts/by-geohashes', async (req, res) => {
+            const { geohashes } = req.body;
+            if (!geohashes || geohashes.length === 0) return res.json([]);
+            const placeholders = geohashes.map(() => '?').join(',');
+            // Only retrieve active alerts for initial load
+            const alertsRaw = await db.all(`SELECT * FROM alerts WHERE geohash IN (${placeholders}) AND status IN ('new', 'accepted') ORDER BY timestamp DESC`, geohashes);
+            res.json(alertsRaw.map(this._formatAlert));
+        });
+
         app.post('/alerts/find-and-update-timeouts', async (req, res) => {
             const now = Date.now();
-            const timedOutAlerts = await db.all('SELECT id FROM alerts WHERE status = ? AND timeoutTimestamp <= ?', ['new', now]);
-            if (timedOutAlerts.length > 0) {
-                const ids = timedOutAlerts.map(a => a.id);
+            const timedOutAlertsRaw = await db.all('SELECT * FROM alerts WHERE status = ? AND timeoutTimestamp <= ?', ['new', now]);
+            if (timedOutAlertsRaw.length > 0) {
+                const ids = timedOutAlertsRaw.map(a => a.id);
                 const placeholders = ids.map(() => '?').join(',');
                 await db.run(`UPDATE alerts SET status = 'timed_out' WHERE id IN (${placeholders})`, ids);
-                res.json({ updatedCount: ids.length, ids });
+                res.json({ updatedCount: ids.length, timedOutAlerts: timedOutAlertsRaw.map(this._formatAlert) });
             } else {
-                res.json({ updatedCount: 0, ids: [] });
+                res.json({ updatedCount: 0, timedOutAlerts: [] });
             }
         });
 
         app.post('/alerts', async (req, res) => {
-            const { citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, timeoutTimestamp } = req.body;
+            const { citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, timeoutTimestamp, geohash } = req.body;
             const result = await db.run(
-                'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, timeoutTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                [citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, timeoutTimestamp]
+                'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, timeoutTimestamp, geohash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, timeoutTimestamp, geohash]
             );
             const newAlertRaw = await db.get('SELECT * FROM alerts WHERE id = ?', result.lastID);
             res.status(201).json(this._formatAlert(newAlertRaw));
@@ -141,6 +156,16 @@ const DatabaseService = {
         // --- FIREFIGHTERS API ---
         app.get('/firefighters', async (req, res) => {
             const firefighters = await db.all('SELECT * FROM firefighters WHERE locationLat IS NOT NULL');
+            res.json(firefighters);
+        });
+
+        app.post('/firefighters/by-units', async (req, res) => {
+            const { unitNumbers } = req.body;
+            if (!unitNumbers || unitNumbers.length === 0) {
+                return res.json([]);
+            }
+            const placeholders = unitNumbers.map(() => '?').join(',');
+            const firefighters = await db.all(`SELECT * FROM firefighters WHERE unitNumber IN (${placeholders})`, unitNumbers);
             res.json(firefighters);
         });
 

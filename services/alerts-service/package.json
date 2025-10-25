@@ -13,6 +13,7 @@
     "amqplib": "^0.10.3",
     "sqlite": "^5.0.1",
     "sqlite3": "^5.1.6",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "ngeohash": "0.6.3"
   }
 }

@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const { connect: connectMessageQueue, publish } = require('../../shared/message-queue');
+const ngeohash = require('ngeohash');
 
 const PORT = process.env.PORT || 3003;
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://location-service:3004';
@@ -56,12 +57,17 @@ const AlertsService = {
     async processTimeouts() {
         try {
             // Offload the timeout check logic to the database service
-            const { updatedCount, ids } = await dbService.request('/alerts/find-and-update-timeouts', { method: 'POST' });
+            const { updatedCount, timedOutAlerts } = await dbService.request('/alerts/find-and-update-timeouts', { method: 'POST' });
 
             if (updatedCount > 0) {
-                console.log(`[Alerts] Found ${updatedCount} timed-out alerts: ${ids.join(', ')}.`);
-                // Notify all clients of the change so their UIs update.
-                publish('alert.broadcast', JSON.stringify({ message: `${updatedCount} alerts timed out.` }));
+                console.log(`[Alerts] Found ${updatedCount} timed-out alerts.`);
+                for (const alert of timedOutAlerts) {
+                    if(alert.geohash) {
+                        try {
+                            publish(`alert.updated.${alert.geohash}`, JSON.stringify(alert));
+                        } catch(e) { console.error(`[Alerts] MQ publish failed for timeout update on alert #${alert.id}`, e); }
+                    }
+                }
             }
         } catch (error) {
             console.error('[Alerts] Error in timeout processor:', error);
@@ -85,12 +91,14 @@ const AlertsService = {
         }
 
         const timestamp = Date.now();
+        // Precision 4 is a grid of approx. 39km x 19.5km, matching client subscriptions.
+        const geohash = ngeohash.encode(location.lat, location.lng, 4);
         let preliminaryAlert;
 
         try {
             // Step 1: Immediately create a preliminary record via the database service.
             const newAlertData = {
-                citizenId, message, audioBase64,
+                citizenId, message, audioBase64, geohash,
                 locationLat: location.lat, locationLng: location.lng,
                 timestamp, status: 'new',
                 timeoutTimestamp: timestamp + (60 * 1000), // 60 second timeout
@@ -100,9 +108,18 @@ const AlertsService = {
             // Step 2: Send the immediate response to the client.
             res.status(201).json(preliminaryAlert);
 
+            // Publish the preliminary alert immediately so the citizen sees it.
+            try {
+                publish(`alert.created.${geohash}`, JSON.stringify(preliminaryAlert));
+            } catch(e) { console.error(`[Alerts] MQ publish failed for preliminary alert #${preliminaryAlert.id}`, e); }
+
         } catch (dbError) {
             console.error('Error creating preliminary alert:', dbError);
-            return res.status(500).json({ message: 'Failed to create alert.' });
+            // Don't send a response if one has already been sent
+            if (!res.headersSent) {
+                return res.status(500).json({ message: 'Failed to create alert.' });
+            }
+            return;
         }
 
         // Step 3: Perform heavy lifting in the background after responding.
@@ -139,8 +156,14 @@ const AlertsService = {
 
             // 3d. Publish events to the message queue.
             if (fullAlert) {
-                publish('alert.created', JSON.stringify({ targetedOfficers, alert: fullAlert }));
-                publish('alert.broadcast', JSON.stringify({ message: 'New alert created and processed' }));
+                // Publish for push notifications
+                try {
+                     publish('alert.created', JSON.stringify({ targetedOfficers, alert: fullAlert }));
+                } catch(e) { console.error(`[Alerts] MQ publish failed for push notification on alert #${alertId}`, e); }
+                // Publish for WebSocket clients
+                try {
+                    publish(`alert.updated.${geohash}`, JSON.stringify(fullAlert));
+                } catch(e) { console.error(`[Alerts] MQ publish failed for WS update on alert #${alertId}`, e); }
                 console.log(`[Alerts] Background processing for alert #${alertId} complete.`);
             }
 
@@ -168,8 +191,16 @@ const AlertsService = {
 
     async deleteAlert(req, res) {
         try {
+            const alertToDelete = await dbService.request(`/alerts/${req.params.id}`);
+            if (!alertToDelete) return res.status(404).send();
+
             await dbService.request(`/alerts/${req.params.id}`, { method: 'DELETE' });
-            publish('alert.broadcast', JSON.stringify({ message: 'Alert deleted' }));
+
+            if(alertToDelete.geohash) {
+                try {
+                    publish(`alert.deleted.${alertToDelete.geohash}`, JSON.stringify({ id: parseInt(req.params.id) }));
+                } catch(e) { console.error(`[Alerts] MQ publish failed for delete on alert #${req.params.id}`, e); }
+            }
             res.status(204).send();
         } catch (error) {
             console.error('Error deleting alert:', error);
@@ -186,7 +217,11 @@ const AlertsService = {
                 return res.status(404).json({ message: 'Alert not found.' });
             }
 
-            publish('alert.broadcast', JSON.stringify({ message: `Alert ${alertId} status updated to ${newStatus}` }));
+            if (updatedAlert.geohash) {
+                try {
+                    publish(`alert.updated.${updatedAlert.geohash}`, JSON.stringify(updatedAlert));
+                } catch(e) { console.error(`[Alerts] MQ publish failed for status update on alert #${alertId}`, e); }
+            }
             res.json(updatedAlert);
         } catch (error) {
             console.error(`Error updating alert to ${newStatus}:`, error);

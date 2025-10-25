@@ -23,8 +23,8 @@ async function setupDatabase() {
         driver: sqlite3.Database
     });
 
-    // --- Schema Definition and Migration ---
-    // This ensures that the necessary tables and columns exist every time the server starts.
+    // --- Step 1: Schema Definition ---
+    // Create tables with the latest schema if they don't exist.
     await db.exec(`
         CREATE TABLE IF NOT EXISTS citizens (
             username TEXT PRIMARY KEY,
@@ -60,12 +60,14 @@ async function setupDatabase() {
             acceptedBy TEXT,
             searchRadius INTEGER,
             timeoutTimestamp INTEGER,
-            targetedOfficers TEXT
+            targetedOfficers TEXT,
+            geohash TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
     `);
 
-    // --- Schema Migrations for existing tables ---
+    // --- Step 2: Schema Migrations ---
+    // Run ALTER TABLE statements to add any missing columns to existing tables.
+    // This ensures backward compatibility with older database files.
     const alertsInfo = await db.all("PRAGMA table_info(alerts)");
     const alertsColumnNames = alertsInfo.map(col => col.name);
 
@@ -75,6 +77,7 @@ async function setupDatabase() {
     if (!alertsColumnNames.includes('timeoutTimestamp')) await db.exec('ALTER TABLE alerts ADD COLUMN timeoutTimestamp INTEGER');
     if (!alertsColumnNames.includes('targetedOfficers')) await db.exec('ALTER TABLE alerts ADD COLUMN targetedOfficers TEXT');
     if (!alertsColumnNames.includes('category')) await db.exec('ALTER TABLE alerts ADD COLUMN category TEXT');
+    if (!alertsColumnNames.includes('geohash')) await db.exec('ALTER TABLE alerts ADD COLUMN geohash TEXT');
 
 
     const policeInfo = await db.all("PRAGMA table_info(police)");
@@ -84,6 +87,12 @@ async function setupDatabase() {
     if (!policeColumnNames.includes('locationLng')) await db.exec('ALTER TABLE police ADD COLUMN locationLng REAL');
     if (!policeColumnNames.includes('department')) await db.exec("ALTER TABLE police ADD COLUMN department TEXT DEFAULT 'Law & Order'");
 
+    // --- Step 3: Create Indexes ---
+    // These are run last to ensure the columns they depend on have been created by the steps above.
+    await db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+        CREATE INDEX IF NOT EXISTS idx_alerts_geohash ON alerts(geohash);
+    `);
 
     console.log(`Database connected at ${dbPath} and tables ensured.`);
     return db;
