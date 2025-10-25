@@ -36,6 +36,7 @@ const AuthService = {
         app.post('/police/login', this.loginPolice);
         app.post('/police/pushtoken', this.updatePushToken);
         app.post('/firefighter/login', this.loginOrRegisterFirefighter);
+        app.post('/firefighter/pushtoken', this.updateFirefighterPushToken);
 
         app.listen(PORT, () => {
             console.log(`Auth Service listening on port ${PORT}`);
@@ -122,6 +123,20 @@ const AuthService = {
             res.status(204).send();
         } catch (error) {
             console.error('Error updating push token:', error);
+            res.status(500).json({ message: 'Failed to update push token.' });
+        }
+    },
+
+    async updateFirefighterPushToken(req, res) {
+        try {
+            const { unitNumber, token } = req.body;
+            if (!unitNumber || !token) {
+                return res.status(400).json({ message: 'Unit number and token are required.' });
+            }
+            await dbService.request(`/firefighters/${unitNumber}/pushtoken`, { method: 'PUT', body: JSON.stringify({ token }) });
+            res.status(204).send();
+        } catch (error) {
+            console.error('Error updating firefighter push token:', error);
             res.status(500).json({ message: 'Failed to update push token.' });
         }
     }

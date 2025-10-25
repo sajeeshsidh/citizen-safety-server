@@ -119,6 +119,7 @@ const routeConfig = [
     { path: '/internal/find-nearby', target: LOCATION_SERVICE_URL },
     { path: '/police/locations', target: LOCATION_SERVICE_URL },
     { path: '/police/location', target: LOCATION_SERVICE_URL },
+    { path: '/firefighter/location', target: LOCATION_SERVICE_URL },
     // Must be after specific police routes
     { path: '/police', target: AUTH_SERVICE_URL },
     { path: '/citizen', target: AUTH_SERVICE_URL },

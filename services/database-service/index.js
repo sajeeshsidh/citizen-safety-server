@@ -154,6 +154,20 @@ const DatabaseService = {
             res.json(firefighter);
         });
 
+        app.put('/firefighters/:unitNumber/pushtoken', async (req, res) => {
+            const { unitNumber } = req.params;
+            const { token } = req.body;
+            await db.run('UPDATE firefighters SET pushToken = ? WHERE unitNumber = ?', token, unitNumber);
+            res.status(204).send();
+        });
+
+        app.put('/firefighters/:unitNumber/location', async (req, res) => {
+            const { unitNumber } = req.params;
+            const { location } = req.body;
+            await db.run('UPDATE firefighters SET locationLat = ?, locationLng = ? WHERE unitNumber = ?', location.lat, location.lng, unitNumber);
+            res.status(204).send();
+        });
+
         app.listen(PORT, () => console.log(`Database Service listening on port ${PORT}`));
     }
 };

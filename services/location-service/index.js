@@ -75,6 +75,7 @@ const LocationService = {
         // Public API for clients
         app.post('/police/location', this.updateLocation);
         app.get('/police/locations', this.getLocations);
+        app.post('/firefighter/location', this.updateFirefighterLocation);
 
         // Internal API for service-to-service communication
         app.post('/find-nearby', async (req, res) => {
@@ -120,6 +121,21 @@ const LocationService = {
         } catch (error) {
             console.error('Error fetching locations:', error);
             res.status(500).json({ message: 'Failed to retrieve locations.' });
+        }
+    },
+
+    async updateFirefighterLocation(req, res) {
+        const { unitNumber, location } = req.body;
+        if (!unitNumber || !location) {
+            return res.status(400).json({ message: 'Unit number and location are required.' });
+        }
+        try {
+            await dbService.request(`/firefighters/${unitNumber}/location`, { method: 'PUT', body: JSON.stringify({ location }) });
+            publish('location.broadcast', JSON.stringify({ message: 'Locations updated' }));
+            res.status(204).send();
+        } catch (error) {
+            console.error('Error updating firefighter location:', error);
+            res.status(500).json({ message: 'Failed to update location.' });
         }
     }
 };
