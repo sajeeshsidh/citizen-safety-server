@@ -11,12 +11,23 @@ app.use(express.json());
 const AuthService = {
     async initialize() {
         await setupDatabase();
-        app.post('/api/citizen/register', this.registerCitizen);
-        app.post('/api/citizen/login', this.loginCitizen);
-        app.post('/api/police/register', this.registerPolice);
-        app.post('/api/police/login', this.loginPolice);
-        app.post('/api/police/pushtoken', this.updatePushToken);
-        app.post('/api/firefighter/login', this.loginOrRegisterFirefighter);
+        // --- Citizen Routes ---
+        const citizenRouter = express.Router();
+        citizenRouter.post('/register', this.registerCitizen);
+        citizenRouter.post('/login', this.loginCitizen);
+        app.use('/citizen', citizenRouter);
+        
+        // --- Police Routes ---
+        const policeRouter = express.Router();
+        policeRouter.post('/register', this.registerPolice);
+        policeRouter.post('/login', this.loginPolice);
+        policeRouter.post('/pushtoken', this.updatePushToken);
+        app.use('/police', policeRouter);
+
+        // --- Firefighter Routes ---
+        const firefighterRouter = express.Router();
+        firefighterRouter.post('/login', this.loginOrRegisterFirefighter);
+        app.use('/firefighter', firefighterRouter);
         
         app.listen(PORT, () => {
             console.log(`Auth Service listening on port ${PORT}`);
@@ -104,6 +115,7 @@ const AuthService = {
     },
 
     async loginOrRegisterFirefighter(req, res) {
+        console.log('[Auth Service] Hit the /firefighter/login route handler.');
         const { unitNumber } = req.body;
         if (!unitNumber) {
             return res.status(400).json({ message: 'Unit number is required.' });

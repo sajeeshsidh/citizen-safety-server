@@ -15,7 +15,7 @@ if (!GOOGLE_MAPS_API_KEY) {
     console.warn("WARNING: GOOGLE_MAPS_API_KEY environment variable is not set. The Directions Service will not work.");
 }
 
-app.get('/api/route', async (req, res) => {
+app.get('/route', async (req, res) => {
     const { origin, destination } = req.query;
     if (!origin || !destination) {
         return res.status(400).json({ message: 'Origin and destination are required.' });

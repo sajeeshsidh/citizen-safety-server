@@ -32,7 +32,7 @@ const emergencyClassificationSchema = {
     required: ['category', 'reason']
 };
 
-app.post('/api/internal/analyze', async (req, res) => {
+app.post('/analyze', async (req, res) => {
     if (!ai) {
         return res.status(500).json({ message: 'AI service is not configured.' });
     }

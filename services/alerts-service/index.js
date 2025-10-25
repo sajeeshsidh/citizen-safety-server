@@ -6,8 +6,10 @@ const { getDb, setupDatabase } = require('../../shared/database');
 const { connect: connectMessageQueue, publish } = require('../../shared/message-queue');
 
 const PORT = process.env.PORT || 3003;
-const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3004';
-const AI_ANALYSIS_SERVICE_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://localhost:3007';
+// Corrected to use the gateway's internal API path
+const LOCATION_SERVICE_INTERNAL_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3004';
+const AI_ANALYSIS_SERVICE_INTERNAL_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://localhost:3007';
+
 const INTER_SERVICE_TIMEOUT_MS = 55000; // 55 seconds timeout for calls to other services
 
 const app = express();
@@ -24,12 +26,14 @@ const AlertsService = {
         await setupDatabase();
         await connectMessageQueue();
 
-        app.get('/api/alerts', this.getAlerts);
-        app.post('/api/alerts', this.createAlert);
-        app.post('/api/alerts/:id/accept', this.acceptAlert);
-        app.post('/api/alerts/:id/resolve', this.resolveAlert);
-        app.post('/api/alerts/:id/cancel', this.cancelAlert);
-        app.delete('/api/alerts/:id', this.deleteAlert);
+        const router = express.Router();
+        router.get('/', this.getAlerts);
+        router.post('/', this.createAlert);
+        router.post('/:id/accept', this.acceptAlert);
+        router.post('/:id/resolve', this.resolveAlert);
+        router.post('/:id/cancel', this.cancelAlert);
+        router.delete('/:id', this.deleteAlert);
+        app.use('/alerts', router);
 
         app.listen(PORT, () => console.log(`Alerts Service listening on port ${PORT}`));
     },
@@ -55,7 +59,7 @@ const AlertsService = {
             // 1. Call the AI Analysis service to get the emergency category.
             let category = 'Law & Order'; // Default category
             try {
-                const aiResponse = await fetch(`${AI_ANALYSIS_SERVICE_URL}/api/internal/analyze`, {
+                const aiResponse = await fetch(`${AI_ANALYSIS_SERVICE_INTERNAL_URL}/analyze`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message, audioBase64 }),
@@ -73,7 +77,7 @@ const AlertsService = {
             }
 
             // 2. Find nearby responders via an HTTP call to the Location Service, now with a category.
-            const response = await fetch(`${LOCATION_SERVICE_URL}/api/internal/find-nearby`, {
+            const response = await fetch(`${LOCATION_SERVICE_INTERNAL_URL}/find-nearby`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ location, category }),

@@ -31,26 +31,6 @@ app.get('/', (req, res) => {
 // --- Proxy Event Handlers ---
 
 /**
- * Logs when a request is forwarded to a downstream service.
- */
-const onProxyReq = (proxyReq, req, res) => {
-    // Construct the target from the proxy request object itself, which is more reliable
-    // than trying to access internal properties of the http-proxy agent.
-    const targetHost = `${proxyReq.protocol}//${proxyReq.host}`;
-    console.log(`[Proxy] Forwarding ${req.method} request to ${targetHost}${req.originalUrl}`);
-};
-
-/**
- * Logs when a response is received from a downstream service.
- */
-const onProxyRes = (proxyRes, req, res) => {
-    // The `proxyRes` is an `http.IncomingMessage`, and its `req` property
-    // is the `http.ClientRequest` (our `proxyReq`). We can use this to get the target.
-    const targetHost = `${proxyRes.req.protocol}//${proxyRes.req.host}`;
-    console.log(`[Proxy] Received response with status ${proxyRes.statusCode} from ${targetHost}${req.originalUrl}`);
-};
-
-/**
  * Handles errors from the proxy, such as timeouts or connection failures.
  */
 const onError = (err, req, res, target) => {
@@ -73,6 +53,18 @@ const onError = (err, req, res, target) => {
  * @returns {object} The configuration object for the proxy.
  */
 const createProxyOptions = (target, pathRewrite = null) => {
+    // Define request/response handlers inside this function to capture `target` in a closure.
+    // This is a robust way to access the target URL for logging, fixing the crash.
+    const onProxyReq = (proxyReq, req) => {
+        const fullTargetUrl = new URL(proxyReq.path, target);
+        console.log(`[Proxy] Forwarding ${req.method} for original URL ${req.originalUrl} to ${fullTargetUrl.href}`);
+    };
+
+    const onProxyRes = (proxyRes, req) => {
+        // Use the same closure pattern to safely get the target for the response log.
+        const fullTargetUrl = new URL(proxyRes.req.path, target);
+        console.log(`[Proxy] Received response with status ${proxyRes.statusCode} from ${fullTargetUrl.href} for ${req.originalUrl}`);
+    };
     const options = {
         target,
         changeOrigin: true,
@@ -93,20 +85,22 @@ const createProxyOptions = (target, pathRewrite = null) => {
 // The order is critical: more specific paths MUST be listed before general paths.
 
 // 1. Internal APIs (not intended for direct client access)
-app.use('/api/internal/analyze', createProxyMiddleware(createProxyOptions(AI_ANALYSIS_SERVICE_URL)));
-app.use('/api/internal/find-nearby', createProxyMiddleware(createProxyOptions(LOCATION_SERVICE_URL)));
+app.use('/api/internal/analyze', createProxyMiddleware(createProxyOptions(AI_ANALYSIS_SERVICE_URL, { '^/api/internal/analyze': '/analyze' })));
+app.use('/api/internal/find-nearby', createProxyMiddleware(createProxyOptions(LOCATION_SERVICE_URL, { '^/api/internal/find-nearby': '/find-nearby' })));
 
 // 2. Location Service (Handles specific '/api/police' routes first to avoid being caught by the general auth proxy)
-app.use('/api/police/locations', createProxyMiddleware(createProxyOptions(LOCATION_SERVICE_URL)));
-app.use('/api/police/location', createProxyMiddleware(createProxyOptions(LOCATION_SERVICE_URL)));
+app.use('/api/police/locations', createProxyMiddleware(createProxyOptions(LOCATION_SERVICE_URL, { '^/api/police/locations': '/police/locations' })));
+app.use('/api/police/location', createProxyMiddleware(createProxyOptions(LOCATION_SERVICE_URL, { '^/api/police/locations': '/police/locations' })));
 
 // 3. Auth Service (Handles all general auth routes with path rewriting to decouple the service)
-const authRewriteRule = { '^/api': '' }; // Rewrites /api/citizen/login to /citizen/login
-app.use(['/api/citizen', '/api/police', '/api/firefighter'], createProxyMiddleware(createProxyOptions(AUTH_SERVICE_URL, authRewriteRule)));
+ // Rewrites /api/citizen/login to /citizen/login
+app.use('/api/citizen', createProxyMiddleware(createProxyOptions(AUTH_SERVICE_URL, { '^/api/citizen': '/citizen' })));
+app.use('/api/firefighter', createProxyMiddleware(createProxyOptions(AUTH_SERVICE_URL, { '^/api/firefighter': '/firefighter' })));
+app.use('/api/police', createProxyMiddleware(createProxyOptions(AUTH_SERVICE_URL, { '^/api/police': '/police' }))); // This is safe because specific police routes are handled above.
 
 // 4. Other Public Services
-app.use('/api/alerts', createProxyMiddleware(createProxyOptions(ALERTS_SERVICE_URL)));
-app.use('/api/route', createProxyMiddleware(createProxyOptions(DIRECTIONS_SERVICE_URL)));
+app.use('/api/alerts', createProxyMiddleware(createProxyOptions(ALERTS_SERVICE_URL, { '^/api/alerts': '/alerts' })));
+app.use('/api/route', createProxyMiddleware(createProxyOptions(DIRECTIONS_SERVICE_URL, { '^/api/route': '/route' })));
 
 
 // --- WebSocket Upgrade Handling ---

@@ -67,11 +67,13 @@ const LocationService = {
         await connectMessageQueue();
 
         // Public API for clients
-        app.post('/api/police/location', this.updateLocation);
-        app.get('/api/police/locations', this.getLocations);
+        const policeRouter = express.Router();
+        policeRouter.post('/location', this.updateLocation);
+        policeRouter.get('/locations', this.getLocations);
+        app.use('/police', policeRouter);
 
         // Internal API for service-to-service communication
-        app.post('/api/internal/find-nearby', async (req, res) => {
+        app.post('/find-nearby', async (req, res) => {
             const { location, category } = req.body;
             if (!location || typeof location.lat !== 'number' || typeof location.lng !== 'number') {
                 return res.status(400).json({ message: 'A valid location object is required.' });
