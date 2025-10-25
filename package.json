@@ -6,7 +6,7 @@
   "scripts": {
     "install-all": "npm install && npm run install:api-gateway && npm run install:services",
     "install:api-gateway": "cd api-gateway && npm install",
-    "install:services": "cd services/alerts-service && npm install && cd ../auth-service && npm install && cd ../directions-service && npm install && cd ../location-service && npm install && cd ../notifications-service && npm install && cd ../websocket-service && npm install"
+    "install:services": "cd services/alerts-service && npm install && cd ../auth-service && npm install && cd ../database-service && npm install && cd ../directions-service && npm install && cd ../location-service && npm install && cd ../notifications-service && npm install && cd ../websocket-service && npm install"
   },
   "workspaces": [
     "api-gateway",

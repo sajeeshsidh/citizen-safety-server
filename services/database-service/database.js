@@ -1,8 +1,8 @@
-
 const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
+const path = require('path');
 
-// This module exports a singleton database connection.
+// This module exports a singleton database connection, used exclusively by the Database Service.
 let db;
 
 /**
@@ -14,8 +14,12 @@ async function setupDatabase() {
     // If the database is already initialized, return the existing instance.
     if (db) return db;
 
+    // The database file will live in the root `server` directory.
+    // __dirname is `services/database-service`, so we go up two levels.
+    const dbPath = path.join(__dirname, '..', '..', 'database.db');
+
     db = await open({
-        filename: './database.db',
+        filename: dbPath,
         driver: sqlite3.Database
     });
 
@@ -81,7 +85,7 @@ async function setupDatabase() {
     if (!policeColumnNames.includes('department')) await db.exec("ALTER TABLE police ADD COLUMN department TEXT DEFAULT 'Law & Order'");
 
 
-    console.log('Database connected and tables ensured.');
+    console.log(`Database connected at ${dbPath} and tables ensured.`);
     return db;
 }
 

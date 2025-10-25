@@ -12,6 +12,7 @@ const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localho
 const DIRECTIONS_SERVICE_URL = process.env.DIRECTIONS_SERVICE_URL || 'http://localhost:3005';
 const WEBSOCKET_SERVICE_URL = process.env.WEBSOCKET_SERVICE_URL || 'ws://localhost:3006';
 const AI_ANALYSIS_SERVICE_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://localhost:3007';
+const DATABASE_SERVICE_URL = process.env.DATABASE_SERVICE_URL || 'http://localhost:3008';
 
 const PORT = process.env.PORT || 3001;
 const PROXY_TIMEOUT_MS = 120000; // 120 seconds (2 minutes) to handle cascading cold starts
@@ -221,7 +222,8 @@ const checkAllServices = async () => {
         checkServiceHealth('Location Service', LOCATION_SERVICE_URL),
         checkServiceHealth('Directions Service', DIRECTIONS_SERVICE_URL),
         checkServiceHealth('AI Analysis Service', AI_ANALYSIS_SERVICE_URL),
-        checkServiceHealth('WebSocket Service', WEBSOCKET_SERVICE_URL)
+        checkServiceHealth('WebSocket Service', WEBSOCKET_SERVICE_URL),
+        checkServiceHealth('Database Service', DATABASE_SERVICE_URL)
     ]);
     console.log('[Health Check] --- Health checks complete ---');
 };

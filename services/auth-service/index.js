@@ -1,54 +1,62 @@
-
 const express = require('express');
 const cors = require('cors');
-const { getDb, setupDatabase } = require('../../shared/database');
+const fetch = require('node-fetch');
 
 const PORT = process.env.PORT || 3002;
+const DATABASE_SERVICE_URL = process.env.DATABASE_SERVICE_URL || 'http://database-service:3008';
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+const dbService = {
+    async request(path, options = {}) {
+        const response = await fetch(`${DATABASE_SERVICE_URL}${path}`, {
+            ...options,
+            headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        });
+        // A 204 response has no body to parse, so return null.
+        if (response.status === 204) return null;
+
+        const data = await response.json();
+        if (!response.ok) {
+            // Forward the error message from the database service.
+            throw new Error(data.message || `Database service error: ${response.status}`);
+        }
+        return data;
+    },
+};
+
 const AuthService = {
     async initialize() {
-        await setupDatabase();
-        // --- Citizen Routes ---
-        const citizenRouter = express.Router();
-        citizenRouter.post('/register', this.registerCitizen);
-        citizenRouter.post('/login', this.loginCitizen);
-        app.use('/citizen', citizenRouter);
-        
-        // --- Police Routes ---
-        const policeRouter = express.Router();
-        policeRouter.post('/register', this.registerPolice);
-        policeRouter.post('/login', this.loginPolice);
-        policeRouter.post('/pushtoken', this.updatePushToken);
-        app.use('/police', policeRouter);
+        app.get('/', (req, res) => res.send('Auth Service is running.'));
 
-        // --- Firefighter Routes ---
-        const firefighterRouter = express.Router();
-        firefighterRouter.post('/login', this.loginOrRegisterFirefighter);
-        app.use('/firefighter', firefighterRouter);
-        
+        app.post('/citizen/register', this.registerCitizen);
+        app.post('/citizen/login', this.loginCitizen);
+        app.post('/police/register', this.registerPolice);
+        app.post('/police/login', this.loginPolice);
+        app.post('/police/pushtoken', this.updatePushToken);
+        app.post('/firefighter/login', this.loginOrRegisterFirefighter);
+
         app.listen(PORT, () => {
             console.log(`Auth Service listening on port ${PORT}`);
             // --- Diagnostic Route Logging ---
             console.log('--- Registered Auth Service Routes ---');
             const listEndpoints = (router, basePath) => {
-              router.stack.forEach((layer) => {
-                if (layer.route) { // Layer is a route handler
-                  const path = layer.route.path;
-                  const methods = Object.keys(layer.route.methods).filter(m => m !== '_all').join(', ').toUpperCase();
-                  if (methods) {
-                    console.log(`Route registered: ${methods} ${basePath}${path === '/' ? '' : path}`);
-                  }
-                } else if (layer.name === 'router') { // Layer is a sub-router
-                  const newBasePath = layer.regexp.source
-                    .replace('^\\', '')
-                    .replace('\\/?(?=\\/|$)', '')
-                    .replace(/\\(.)/g, '$1');
-                  listEndpoints(layer.handle, `${basePath}${newBasePath}`);
-                }
-              });
+                router.stack.forEach((layer) => {
+                    if (layer.route) { // Layer is a route handler
+                        const path = layer.route.path;
+                        const methods = Object.keys(layer.route.methods).filter(m => m !== '_all').join(', ').toUpperCase();
+                        if (methods) {
+                            console.log(`Route registered: ${methods} ${basePath}${path === '/' ? '' : path}`);
+                        }
+                    } else if (layer.name === 'router') { // Layer is a sub-router
+                        const newBasePath = layer.regexp.source
+                            .replace('^\\', '')
+                            .replace('\\/?(?=\\/|$)', '')
+                            .replace(/\\(.)/g, '$1');
+                        listEndpoints(layer.handle, `${basePath}${newBasePath}`);
+                    }
+                });
             };
 
             listEndpoints(app._router, '');
@@ -57,105 +65,60 @@ const AuthService = {
     },
 
     async registerCitizen(req, res) {
-        const { username, password } = req.body;
-        if (!username || !password) {
-            return res.status(400).json({ message: 'Username and password are required.' });
-        }
         try {
-            const db = getDb();
-            await db.run('INSERT INTO citizens (username, password) VALUES (?, ?)', username, password);
-            res.status(201).json({ username });
+            const user = await dbService.request('/citizens/register', { method: 'POST', body: JSON.stringify(req.body) });
+            res.status(201).json(user);
         } catch (error) {
-            if (error.code === 'SQLITE_CONSTRAINT') {
-                return res.status(409).json({ message: 'Username already exists.' });
-            }
-            console.error('Error registering citizen:', error);
-            res.status(500).json({ message: 'Registration failed.' });
+            // Assuming 409 for constraint violation from dbService
+            res.status(409).json({ message: error.message });
         }
     },
 
     async loginCitizen(req, res) {
-        const { username, password } = req.body;
         try {
-            const db = getDb();
-            const user = await db.get('SELECT * FROM citizens WHERE username = ? AND password = ?', username, password);
-            if (user) {
-                res.json({ username: user.username });
-            } else {
-                res.status(401).json({ message: 'Invalid username or password.' });
-            }
+            const user = await dbService.request('/citizens/login', { method: 'POST', body: JSON.stringify(req.body) });
+            res.json(user);
         } catch (error) {
-            console.error('Error logging in citizen:', error);
-            res.status(500).json({ message: 'Login failed.' });
+            // Assuming 401 for login failure from dbService
+            res.status(401).json({ message: error.message });
         }
     },
 
     async registerPolice(req, res) {
-        const { name, designation, badgeNumber, phoneNumber, department } = req.body;
-        if (!name || !designation || !badgeNumber || !phoneNumber) {
-            return res.status(400).json({ message: 'All fields are required for police registration.' });
-        }
         try {
-            const db = getDb();
-            await db.run(
-                'INSERT INTO police (name, designation, badgeNumber, phoneNumber, department) VALUES (?, ?, ?, ?, ?)',
-                name, designation, badgeNumber, phoneNumber, department || 'Law & Order'
-            );
-            res.status(201).json({ name, designation, badgeNumber, phoneNumber });
+            const officer = await dbService.request('/police/register', { method: 'POST', body: JSON.stringify(req.body) });
+            res.status(201).json(officer);
         } catch (error) {
-            if (error.code === 'SQLITE_CONSTRAINT') {
-                return res.status(409).json({ message: 'Badge number already registered.' });
-            }
-            console.error('Error registering police:', error);
-            res.status(500).json({ message: 'Police registration failed.' });
+            res.status(409).json({ message: error.message });
         }
     },
 
     async loginPolice(req, res) {
-        const { badgeNumber } = req.body;
         try {
-            const db = getDb();
-            const officer = await db.get('SELECT * FROM police WHERE badgeNumber = ?', badgeNumber);
-            if (officer) {
-                res.json(officer);
-            } else {
-                res.status(401).json({ message: 'Invalid badge number.' });
-            }
+            const officer = await dbService.request('/police/login', { method: 'POST', body: JSON.stringify(req.body) });
+            res.json(officer);
         } catch (error) {
-            console.error('Error logging in police:', error);
-            res.status(500).json({ message: 'Police login failed.' });
+            res.status(401).json({ message: error.message });
         }
     },
 
     async loginOrRegisterFirefighter(req, res) {
-        console.log('[Auth Service] Hit the /firefighter/login route handler.');
-        const { unitNumber } = req.body;
-        if (!unitNumber) {
-            return res.status(400).json({ message: 'Unit number is required.' });
-        }
         try {
-            const db = getDb();
-            let firefighter = await db.get('SELECT * FROM firefighters WHERE unitNumber = ?', unitNumber);
-            if (!firefighter) {
-                // Auto-register if not found for demo purposes
-                await db.run('INSERT INTO firefighters (unitNumber, department) VALUES (?, ?)', unitNumber, 'Fire & Rescue');
-                firefighter = await db.get('SELECT * FROM firefighters WHERE unitNumber = ?', unitNumber);
-            }
+            const firefighter = await dbService.request('/firefighters/login', { method: 'POST', body: JSON.stringify(req.body) });
             res.json(firefighter);
         } catch (error) {
-            console.error('Error logging in/registering firefighter:', error);
-            res.status(500).json({ message: 'Firefighter login failed.' });
+            console.error('Error in loginOrRegisterFirefighter:', error);
+            res.status(500).json({ message: 'Login/Registration failed.' });
         }
     },
 
     async updatePushToken(req, res) {
-        const { badgeNumber, token } = req.body;
-        if (!badgeNumber || !token) {
-            return res.status(400).json({ message: 'Badge number and token are required.' });
-        }
         try {
-            const db = getDb();
-            await db.run('UPDATE police SET pushToken = ? WHERE badgeNumber = ?', token, badgeNumber);
+            const { badgeNumber, token } = req.body;
+            if (!badgeNumber || !token) {
+                return res.status(400).json({ message: 'Badge number and token are required.' });
+            }
+            await dbService.request(`/police/${badgeNumber}/pushtoken`, { method: 'PUT', body: JSON.stringify({ token }) });
             res.status(204).send();
         } catch (error) {
             console.error('Error updating push token:', error);

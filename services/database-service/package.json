@@ -1,5 +1,5 @@
 {
-  "name": "websocket-service",
+  "name": "database-service",
   "version": "1.0.0",
   "private": true,
   "main": "index.js",
@@ -7,9 +7,8 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "amqplib": "^0.10.3",
-    "node-fetch": "^2.7.0",
-    "ws": "^8.13.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
     "sqlite": "^5.0.1",
     "sqlite3": "^5.1.6"
   }

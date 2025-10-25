@@ -1,17 +1,28 @@
-
 const express = require('express');
 const cors = require('cors');
-const { getDb, setupDatabase } = require('../../shared/database');
+const fetch = require('node-fetch');
 const { connect: connectMessageQueue, publish } = require('../../shared/message-queue');
 
 const PORT = process.env.PORT || 3004;
+const DATABASE_SERVICE_URL = process.env.DATABASE_SERVICE_URL || 'http://database-service:3008';
 const SEARCH_RADIUS_KM = 5;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- Geospatial Helper Functions ---
+const dbService = {
+    async request(path, options = {}) {
+        const response = await fetch(`${DATABASE_SERVICE_URL}${path}`, {
+            ...options,
+            headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        });
+        if (response.status === 204) return null;
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || `Database service error: ${response.status}`);
+        return data;
+    },
+};
 
 /**
  * Calculates the distance between two lat/lng points in kilometers.
@@ -30,22 +41,17 @@ function getHaversineDistance(lat1, lon1, lat2, lon2) {
 
 /**
  * Finds all responders of a specific category within a radius of a location.
- * @param {{ lat: number, lng: number }} location - The center point of the search.
- * @param {string} category - The category of emergency (e.g., 'Law & Order', 'Fire & Rescue').
- * @returns {Promise<string[]>} A promise that resolves with an array of responder IDs.
  */
 async function findNearbyResponders(location, category) {
-    const db = getDb();
     let responders = [];
 
-    // Query the appropriate table based on the category
+    // Fetch responders data from the database service
     if (category === 'Law & Order') {
-        responders = await db.all('SELECT badgeNumber as id, locationLat, locationLng FROM police WHERE locationLat IS NOT NULL');
+        responders = await dbService.request('/police');
     } else if (category === 'Fire & Rescue') {
-        responders = await db.all('SELECT unitNumber as id, locationLat, locationLng FROM firefighters WHERE locationLat IS NOT NULL');
+        responders = await dbService.request('/firefighters');
     } else {
-        // Default to searching police if category is unknown
-        responders = await db.all('SELECT badgeNumber as id, locationLat, locationLng FROM police WHERE locationLat IS NOT NULL');
+        responders = await dbService.request('/police');
     }
 
     const nearbyResponderIds = [];
@@ -55,7 +61,8 @@ async function findNearbyResponders(location, category) {
             responder.locationLat, responder.locationLng
         );
         if (distance <= SEARCH_RADIUS_KM) {
-            nearbyResponderIds.push(responder.id);
+            // Use the correct primary key for each responder type
+            nearbyResponderIds.push(responder.badgeNumber || responder.unitNumber);
         }
     }
     return nearbyResponderIds;
@@ -63,14 +70,11 @@ async function findNearbyResponders(location, category) {
 
 const LocationService = {
     async initialize() {
-        await setupDatabase();
         await connectMessageQueue();
 
         // Public API for clients
-        const policeRouter = express.Router();
-        policeRouter.post('/location', this.updateLocation);
-        policeRouter.get('/locations', this.getLocations);
-        app.use('/police', policeRouter);
+        app.post('/police/location', this.updateLocation);
+        app.get('/police/locations', this.getLocations);
 
         // Internal API for service-to-service communication
         app.post('/find-nearby', async (req, res) => {
@@ -79,7 +83,6 @@ const LocationService = {
                 return res.status(400).json({ message: 'A valid location object is required.' });
             }
             try {
-                // Use the category to find the right type of responders
                 const responderIds = await findNearbyResponders(location, category || 'Law & Order');
                 res.status(200).json({ responderIds });
             } catch (error) {
@@ -97,12 +100,7 @@ const LocationService = {
             return res.status(400).json({ message: 'Badge number and location are required.' });
         }
         try {
-            const db = getDb();
-            await db.run(
-                'UPDATE police SET locationLat = ?, locationLng = ? WHERE badgeNumber = ?',
-                location.lat, location.lng, badgeNumber
-            );
-            // Publish an event to notify other services (like WebSocket) of the update.
+            await dbService.request(`/police/${badgeNumber}/location`, { method: 'PUT', body: JSON.stringify({ location }) });
             publish('location.broadcast', JSON.stringify({ message: 'Locations updated' }));
             res.status(204).send();
         } catch (error) {
@@ -113,8 +111,7 @@ const LocationService = {
 
     async getLocations(req, res) {
         try {
-            const db = getDb();
-            const officers = await db.all('SELECT badgeNumber, locationLat, locationLng FROM police WHERE locationLat IS NOT NULL');
+            const officers = await dbService.request('/police');
             const locations = officers.map(o => ({
                 badgeNumber: o.badgeNumber,
                 location: { lat: o.locationLat, lng: o.locationLng },

@@ -1,9 +1,23 @@
 
 const { Expo } = require('expo-server-sdk');
-const { getDb, setupDatabase } = require('../../shared/database');
+const fetch = require('node-fetch');
 const { connect: connectMessageQueue, subscribe } = require('../../shared/message-queue');
 
+const DATABASE_SERVICE_URL = process.env.DATABASE_SERVICE_URL || 'http://database-service:3008';
 const expo = new Expo();
+
+const dbService = {
+    async request(path, options = {}) {
+        const response = await fetch(`${DATABASE_SERVICE_URL}${path}`, {
+            ...options,
+            headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        });
+        if (response.status === 204) return null;
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || `Database service error: ${response.status}`);
+        return data;
+    },
+};
 
 /**
  * The Notifications Service is a "headless" service. It has no HTTP API.
@@ -12,7 +26,6 @@ const expo = new Expo();
 const NotificationsService = {
     async initialize() {
         console.log("Initializing Notifications Service...");
-        await setupDatabase();
         await connectMessageQueue();
 
         // Subscribe to events that should trigger a push notification.
@@ -30,14 +43,15 @@ const NotificationsService = {
                 return;
             }
 
-            // 1. Get the push tokens for the targeted officers from the database.
-            const db = getDb();
-            const placeholders = targetedOfficers.map(() => '?').join(',');
-            const officers = await db.all(`SELECT pushToken FROM police WHERE badgeNumber IN (${placeholders})`, targetedOfficers);
+            // 1. Get the push tokens for the targeted officers from the database service.
+            const officers = await dbService.request('/police/by-badges', {
+                method: 'POST',
+                body: JSON.stringify({ badgeNumbers: targetedOfficers })
+            });
 
             const pushTokens = officers
                 .map(o => o.pushToken)
-                .filter(token => Expo.isExpoPushToken(token));
+                .filter(token => token && Expo.isExpoPushToken(token));
 
             if (pushTokens.length === 0) {
                 console.log(`[Notifications] No valid push tokens found for targeted officers of alert #${alert.id}.`);

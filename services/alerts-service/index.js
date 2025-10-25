@@ -1,12 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
-const { getDb, setupDatabase } = require('../../shared/database');
 const { connect: connectMessageQueue, publish } = require('../../shared/message-queue');
 
 const PORT = process.env.PORT || 3003;
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://location-service:3004';
 const AI_ANALYSIS_SERVICE_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://ai-analysis-service:3007';
+const DATABASE_SERVICE_URL = process.env.DATABASE_SERVICE_URL || 'http://database-service:3008';
 const INTER_SERVICE_TIMEOUT_MS = 110000; // 110 seconds timeout for calls to other services
 
 const app = express();
@@ -15,14 +15,27 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 /**
- * The Alerts Service orchestrates the entire lifecycle of an alert, from creation to resolution.
- * It is a standalone server that communicates with other services over the network.
+ * A helper object for making standardized requests to the internal Database Service.
  */
+const dbService = {
+    async request(path, options = {}) {
+        const response = await fetch(`${DATABASE_SERVICE_URL}${path}`, {
+            ...options,
+            headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        });
+        if (response.status === 204) return null; // Handle No Content responses
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.message || `Database service error: ${response.status}`);
+        }
+        return data;
+    },
+};
+
 const AlertsService = {
     timeoutProcessorInterval: null,
 
     async initialize() {
-        await setupDatabase();
         await connectMessageQueue();
 
         app.get('/', (req, res) => res.send('Alerts Service is running.'));
@@ -34,7 +47,7 @@ const AlertsService = {
         app.delete('/alerts/:id', this.deleteAlert);
 
         app.listen(PORT, () => console.log(`Alerts Service listening on port ${PORT}`));
-        
+
         // Start the background process to handle alert timeouts.
         this.timeoutProcessorInterval = setInterval(this.processTimeouts.bind(this), 5000); // Check every 5 seconds
         console.log('[Alerts] Started background timeout processor.');
@@ -42,29 +55,13 @@ const AlertsService = {
 
     async processTimeouts() {
         try {
-            const db = getDb();
-            const now = Date.now();
-            
-            // Find alerts that are still 'new' and have passed their timeout timestamp.
-            const timedOutAlerts = await db.all(
-                'SELECT id FROM alerts WHERE status = ? AND timeoutTimestamp <= ?',
-                ['new', now]
-            );
+            // Offload the timeout check logic to the database service
+            const { updatedCount, ids } = await dbService.request('/alerts/find-and-update-timeouts', { method: 'POST' });
 
-            if (timedOutAlerts.length > 0) {
-                const ids = timedOutAlerts.map(a => a.id);
-                console.log(`[Alerts] Found ${ids.length} timed-out alerts: ${ids.join(', ')}.`);
-
-                // Create placeholders for the IN clause to update them all at once.
-                const placeholders = ids.map(() => '?').join(',');
-
-                await db.run(
-                    `UPDATE alerts SET status = 'timed_out' WHERE id IN (${placeholders})`,
-                    ids
-                );
-
+            if (updatedCount > 0) {
+                console.log(`[Alerts] Found ${updatedCount} timed-out alerts: ${ids.join(', ')}.`);
                 // Notify all clients of the change so their UIs update.
-                publish('alert.broadcast', JSON.stringify({ message: `${ids.length} alerts timed out.` }));
+                publish('alert.broadcast', JSON.stringify({ message: `${updatedCount} alerts timed out.` }));
             }
         } catch (error) {
             console.error('[Alerts] Error in timeout processor:', error);
@@ -73,9 +70,7 @@ const AlertsService = {
 
     async getAlerts(req, res) {
         try {
-            const db = getDb();
-            const alertsRaw = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
-            const alerts = AlertsService._formatAlerts(alertsRaw);
+            const alerts = await dbService.request('/alerts');
             res.json(alerts);
         } catch (error) {
             console.error('Error fetching alerts:', error);
@@ -89,32 +84,27 @@ const AlertsService = {
             return res.status(400).json({ message: 'Citizen ID and location are required.' });
         }
 
-        const db = getDb();
         const timestamp = Date.now();
         let preliminaryAlert;
 
         try {
-            // Step 1: Immediately create a preliminary record in the database.
+            // Step 1: Immediately create a preliminary record via the database service.
             const newAlertData = {
                 citizenId, message, audioBase64,
                 locationLat: location.lat, locationLng: location.lng,
                 timestamp, status: 'new',
-                timeoutTimestamp: timestamp + (30 * 1000), // 30 second timeout
+                timeoutTimestamp: timestamp + (60 * 1000), // 60 second timeout
             };
-            const result = await db.run(
-                'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, timeoutTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                [newAlertData.citizenId, newAlertData.message, newAlertData.audioBase64, newAlertData.locationLat, newAlertData.locationLng, newAlertData.timestamp, newAlertData.status, newAlertData.timeoutTimestamp]
-            );
-            preliminaryAlert = { id: result.lastID, ...newAlertData };
+            preliminaryAlert = await dbService.request('/alerts', { method: 'POST', body: JSON.stringify(newAlertData) });
 
             // Step 2: Send the immediate response to the client.
-            res.status(201).json(AlertsService._formatAlert(preliminaryAlert));
+            res.status(201).json(preliminaryAlert);
 
         } catch (dbError) {
             console.error('Error creating preliminary alert:', dbError);
             return res.status(500).json({ message: 'Failed to create alert.' });
         }
-        
+
         // Step 3: Perform heavy lifting in the background after responding.
         try {
             const alertId = preliminaryAlert.id;
@@ -122,12 +112,7 @@ const AlertsService = {
             // 3a. AI Analysis
             let category = 'Law & Order'; // Default category
             try {
-                const aiResponse = await fetch(`${AI_ANALYSIS_SERVICE_URL}/analyze`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message, audioBase64 }),
-                    timeout: INTER_SERVICE_TIMEOUT_MS,
-                });
+                const aiResponse = await fetch(`${AI_ANALYSIS_SERVICE_URL}/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message, audioBase64 }), timeout: INTER_SERVICE_TIMEOUT_MS });
                 if (aiResponse.ok) {
                     const aiResult = await aiResponse.json();
                     category = aiResult.category;
@@ -136,37 +121,24 @@ const AlertsService = {
                     console.warn(`[Alerts] AI analysis for alert #${alertId} failed with status ${aiResponse.status}, using default category.`);
                 }
             } catch (aiError) {
-                console.error(`[Alerts] Error calling AI service for alert #${alertId}, using default category:`, aiError);
+                console.error(`[Alerts] Error calling AI service for alert #${alertId}:`, aiError);
             }
 
             // 3b. Find Nearby Responders
             let targetedOfficers = [];
             try {
-                const locationResponse = await fetch(`${LOCATION_SERVICE_URL}/find-nearby`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ location, category }),
-                    timeout: INTER_SERVICE_TIMEOUT_MS,
-                });
-                if (locationResponse.ok) {
-                    const locationResult = await locationResponse.json();
-                    targetedOfficers = locationResult.responderIds || [];
-                } else {
-                    console.warn(`[Alerts] Location service call for alert #${alertId} failed with status ${locationResponse.status}.`);
-                }
+                const locationResponse = await fetch(`${LOCATION_SERVICE_URL}/find-nearby`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ location, category }), timeout: INTER_SERVICE_TIMEOUT_MS });
+                if (locationResponse.ok) targetedOfficers = (await locationResponse.json()).responderIds || [];
+                else console.warn(`[Alerts] Location service call for alert #${alertId} failed with status ${locationResponse.status}.`);
             } catch (locationError) {
                 console.error(`[Alerts] Error calling Location service for alert #${alertId}:`, locationError);
             }
-            
-            // 3c. Update the alert record with the new info
-            await db.run(
-                'UPDATE alerts SET category = ?, targetedOfficers = ? WHERE id = ?',
-                [category, JSON.stringify(targetedOfficers), alertId]
-            );
-            
+
+            // 3c. Update the alert record with the new info via the database service.
+            const fullAlert = await dbService.request(`/alerts/${alertId}`, { method: 'PUT', body: JSON.stringify({ category, targetedOfficers: JSON.stringify(targetedOfficers) }) });
+
             // 3d. Publish events to the message queue.
-            const fullAlert = await db.get('SELECT * from alerts WHERE id = ?', alertId);
-            if(fullAlert){
+            if (fullAlert) {
                 publish('alert.created', JSON.stringify({ targetedOfficers, alert: fullAlert }));
                 publish('alert.broadcast', JSON.stringify({ message: 'New alert created and processed' }));
                 console.log(`[Alerts] Background processing for alert #${alertId} complete.`);
@@ -196,8 +168,7 @@ const AlertsService = {
 
     async deleteAlert(req, res) {
         try {
-            const db = getDb();
-            await db.run('DELETE FROM alerts WHERE id = ?', req.params.id);
+            await dbService.request(`/alerts/${req.params.id}`, { method: 'DELETE' });
             publish('alert.broadcast', JSON.stringify({ message: 'Alert deleted' }));
             res.status(204).send();
         } catch (error) {
@@ -208,19 +179,13 @@ const AlertsService = {
 
     async _updateAlertStatus(res, alertId, newStatus, extraData = {}) {
         try {
-            const db = getDb();
             const fieldsToUpdate = { status: newStatus, ...extraData };
-            const setClauses = Object.keys(fieldsToUpdate).map(key => `${key} = ?`).join(', ');
-            const values = Object.values(fieldsToUpdate);
+            const updatedAlert = await dbService.request(`/alerts/${alertId}`, { method: 'PUT', body: JSON.stringify(fieldsToUpdate) });
 
-            await db.run(`UPDATE alerts SET ${setClauses} WHERE id = ?`, [...values, alertId]);
-            const updatedAlertRaw = await db.get('SELECT * FROM alerts WHERE id = ?', alertId);
-
-            if (!updatedAlertRaw) {
+            if (!updatedAlert) {
                 return res.status(404).json({ message: 'Alert not found.' });
             }
 
-            const updatedAlert = AlertsService._formatAlert(updatedAlertRaw);
             publish('alert.broadcast', JSON.stringify({ message: `Alert ${alertId} status updated to ${newStatus}` }));
             res.json(updatedAlert);
         } catch (error) {
@@ -228,29 +193,6 @@ const AlertsService = {
             res.status(500).json({ message: 'Failed to update alert status.' });
         }
     },
-
-    _formatAlert(alert) {
-        if (!alert) return null;
-        const newAlert = { ...alert };
-        if (newAlert.targetedOfficers) {
-            try {
-                newAlert.targetedOfficers = JSON.parse(newAlert.targetedOfficers);
-            } catch (e) {
-                console.error('JSON parsing failed for targetOfficers', e);
-                newAlert.targetedOfficers = [];
-            }
-        }
-        if (newAlert.locationLat && newAlert.locationLng) {
-            newAlert.location = { lat: newAlert.locationLat, lng: newAlert.locationLng };
-        }
-        delete newAlert.locationLat;
-        delete newAlert.locationLng;
-        return newAlert;
-    },
-
-    _formatAlerts(alerts) {
-        return alerts.map(alert => this._formatAlert(alert));
-    }
 };
 
 AlertsService.initialize();
