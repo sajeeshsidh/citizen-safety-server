@@ -76,23 +76,25 @@ const onError = (err, req, res, target) => {
 
 // --- Dynamic Routing Configuration ---
 
-// Define the routing map. Order is important: more specific paths must come first.
+// Define the routing map. The path is relative to the '/api' mount point.
+// Order is important: more specific paths must come first.
 const routeConfig = [
-    { path: '/api/internal/analyze', target: AI_ANALYSIS_SERVICE_URL },
-    { path: '/api/internal/find-nearby', target: LOCATION_SERVICE_URL },
-    { path: '/api/police/locations', target: LOCATION_SERVICE_URL },
-    { path: '/api/police/location', target: LOCATION_SERVICE_URL },
+    { path: '/internal/analyze', target: AI_ANALYSIS_SERVICE_URL },
+    { path: '/internal/find-nearby', target: LOCATION_SERVICE_URL },
+    { path: '/police/locations', target: LOCATION_SERVICE_URL },
+    { path: '/police/location', target: LOCATION_SERVICE_URL },
     // Must be after specific police routes
-    { path: '/api/police', target: AUTH_SERVICE_URL },
-    { path: '/api/citizen', target: AUTH_SERVICE_URL },
-    { path: '/api/firefighter', target: AUTH_SERVICE_URL },
-    { path: '/api/alerts', target: ALERTS_SERVICE_URL },
-    { path: '/api/route', target: DIRECTIONS_SERVICE_URL },
+    { path: '/police', target: AUTH_SERVICE_URL },
+    { path: '/citizen', target: AUTH_SERVICE_URL },
+    { path: '/firefighter', target: AUTH_SERVICE_URL },
+    { path: '/alerts', target: ALERTS_SERVICE_URL },
+    { path: '/route', target: DIRECTIONS_SERVICE_URL },
 ];
 
 // Router function to select the target based on the request path.
 const router = (req) => {
     for (const route of routeConfig) {
+        // req.path is stripped of the '/api' prefix by Express
         if (req.path.startsWith(route.path)) {
             return route.target;
         }
@@ -100,11 +102,10 @@ const router = (req) => {
     return null; // Should not happen if routes are configured correctly
 };
 
-// Define path rewrite rules. More specific rules must come first.
+// Define path rewrite rules. These are applied to the path seen by the proxy (e.g., '/internal/analyze').
 const pathRewrite = {
-    '^/api/internal/analyze': '/analyze',
-    '^/api/internal/find-nearby': '/find-nearby',
-    '^/api': '' // General rule to strip '/api' prefix for all other services
+    '^/internal/analyze': '/analyze',
+    '^/internal/find-nearby': '/find-nearby'
 };
 
 // --- Single API Gateway Proxy ---
@@ -122,6 +123,7 @@ const apiProxy = createProxyMiddleware({
 
 // --- API Gateway Proxy Routing ---
 
+// All API requests are handled by the single proxy instance.
 app.use('/api', apiProxy);
 
 
