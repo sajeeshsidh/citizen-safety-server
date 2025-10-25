@@ -133,9 +133,11 @@ const router = (req) => {
         if (req.path.startsWith(route.path)) {
             // Attach the selected target to the request object for use in event handlers.
             req.selectedTarget = route.target;
+            // Return the target to the proxy middleware.
+            return route.target;
         }
     }
-    // If no route matches, throw the custom error to be caught by onError.
+    // If no route matches after checking all possibilities, throw the custom error.
     throw new Error(UNROUTABLE_ERROR_MESSAGE);
 };
 
