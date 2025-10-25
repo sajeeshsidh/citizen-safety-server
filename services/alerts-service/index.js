@@ -6,11 +6,9 @@ const { getDb, setupDatabase } = require('../../shared/database');
 const { connect: connectMessageQueue, publish } = require('../../shared/message-queue');
 
 const PORT = process.env.PORT || 3003;
-// Corrected to use the gateway's internal API path
-const LOCATION_SERVICE_INTERNAL_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3004';
-const AI_ANALYSIS_SERVICE_INTERNAL_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://localhost:3007';
-
-const INTER_SERVICE_TIMEOUT_MS = 55000; // 55 seconds timeout for calls to other services
+const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://location-service:3004';
+const AI_ANALYSIS_SERVICE_URL = process.env.AI_ANALYSIS_SERVICE_URL || 'http://ai-analysis-service:3007';
+const INTER_SERVICE_TIMEOUT_MS = 110000; // 110 seconds timeout for calls to other services
 
 const app = express();
 app.use(cors());
@@ -26,14 +24,13 @@ const AlertsService = {
         await setupDatabase();
         await connectMessageQueue();
 
-        const router = express.Router();
-        router.get('/', this.getAlerts);
-        router.post('/', this.createAlert);
-        router.post('/:id/accept', this.acceptAlert);
-        router.post('/:id/resolve', this.resolveAlert);
-        router.post('/:id/cancel', this.cancelAlert);
-        router.delete('/:id', this.deleteAlert);
-        app.use('/alerts', router);
+        app.get('/', (req, res) => res.send('Alerts Service is running.'));
+        app.post('/alerts', this.createAlert);
+        app.get('/alerts', this.getAlerts);
+        app.post('/alerts/:id/accept', this.acceptAlert);
+        app.post('/alerts/:id/resolve', this.resolveAlert);
+        app.post('/alerts/:id/cancel', this.cancelAlert);
+        app.delete('/alerts/:id', this.deleteAlert);
 
         app.listen(PORT, () => console.log(`Alerts Service listening on port ${PORT}`));
     },
@@ -55,11 +52,41 @@ const AlertsService = {
         if (!citizenId || !location) {
             return res.status(400).json({ message: 'Citizen ID and location are required.' });
         }
+
+        const db = getDb();
+        const timestamp = Date.now();
+        let preliminaryAlert;
+
         try {
-            // 1. Call the AI Analysis service to get the emergency category.
+            // Step 1: Immediately create a preliminary record in the database.
+            const newAlertData = {
+                citizenId, message, audioBase64,
+                locationLat: location.lat, locationLng: location.lng,
+                timestamp, status: 'new',
+                timeoutTimestamp: timestamp + (30 * 1000), // 30 second timeout
+            };
+            const result = await db.run(
+                'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, timeoutTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [newAlertData.citizenId, newAlertData.message, newAlertData.audioBase64, newAlertData.locationLat, newAlertData.locationLng, newAlertData.timestamp, newAlertData.status, newAlertData.timeoutTimestamp]
+            );
+            preliminaryAlert = { id: result.lastID, ...newAlertData };
+
+            // Step 2: Send the immediate response to the client.
+            res.status(201).json(AlertsService._formatAlert(preliminaryAlert));
+
+        } catch (dbError) {
+            console.error('Error creating preliminary alert:', dbError);
+            return res.status(500).json({ message: 'Failed to create alert.' });
+        }
+        
+        // Step 3: Perform heavy lifting in the background after responding.
+        try {
+            const alertId = preliminaryAlert.id;
+
+            // 3a. AI Analysis
             let category = 'Law & Order'; // Default category
             try {
-                const aiResponse = await fetch(`${AI_ANALYSIS_SERVICE_INTERNAL_URL}/analyze`, {
+                const aiResponse = await fetch(`${AI_ANALYSIS_SERVICE_URL}/analyze`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message, audioBase64 }),
@@ -68,46 +95,49 @@ const AlertsService = {
                 if (aiResponse.ok) {
                     const aiResult = await aiResponse.json();
                     category = aiResult.category;
-                    console.log(`[Alerts] AI analysis result: ${category}`);
+                    console.log(`[Alerts] AI analysis for alert #${alertId} result: ${category}`);
                 } else {
-                    console.warn('[Alerts] AI analysis failed, using default category.');
+                    console.warn(`[Alerts] AI analysis for alert #${alertId} failed with status ${aiResponse.status}, using default category.`);
                 }
             } catch (aiError) {
-                console.error('[Alerts] Error calling AI service, using default category:', aiError);
+                console.error(`[Alerts] Error calling AI service for alert #${alertId}, using default category:`, aiError);
             }
 
-            // 2. Find nearby responders via an HTTP call to the Location Service, now with a category.
-            const response = await fetch(`${LOCATION_SERVICE_INTERNAL_URL}/find-nearby`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ location, category }),
-                timeout: INTER_SERVICE_TIMEOUT_MS,
-            });
-            const { responderIds: targetedOfficers } = response.ok ? await response.json() : { responderIds: [] };
-
-            // 3. Save the new alert to the database with the category.
-            const db = getDb();
-            const timestamp = Date.now();
-            const newAlertData = {
-                citizenId, message, audioBase64,
-                locationLat: location.lat, locationLng: location.lng,
-                timestamp, status: 'new', category,
-                targetedOfficers: JSON.stringify(targetedOfficers),
-                timeoutTimestamp: timestamp + (30 * 1000), // 30 second timeout
-            };
-            const result = await db.run(
-                'INSERT INTO alerts (citizenId, message, audioBase64, locationLat, locationLng, timestamp, status, category, targetedOfficers, timeoutTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                Object.values(newAlertData)
+            // 3b. Find Nearby Responders
+            let targetedOfficers = [];
+            try {
+                const locationResponse = await fetch(`${LOCATION_SERVICE_URL}/find-nearby`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ location, category }),
+                    timeout: INTER_SERVICE_TIMEOUT_MS,
+                });
+                if (locationResponse.ok) {
+                    const locationResult = await locationResponse.json();
+                    targetedOfficers = locationResult.responderIds || [];
+                } else {
+                    console.warn(`[Alerts] Location service call for alert #${alertId} failed with status ${locationResponse.status}.`);
+                }
+            } catch (locationError) {
+                console.error(`[Alerts] Error calling Location service for alert #${alertId}:`, locationError);
+            }
+            
+            // 3c. Update the alert record with the new info
+            await db.run(
+                'UPDATE alerts SET category = ?, targetedOfficers = ? WHERE id = ?',
+                [category, JSON.stringify(targetedOfficers), alertId]
             );
-            const createdAlert = { id: result.lastID, ...newAlertData };
+            
+            // 3d. Publish events to the message queue.
+            const fullAlert = await db.get('SELECT * from alerts WHERE id = ?', alertId);
+            if(fullAlert){
+                publish('alert.created', JSON.stringify({ targetedOfficers, alert: fullAlert }));
+                publish('alert.broadcast', JSON.stringify({ message: 'New alert created and processed' }));
+                console.log(`[Alerts] Background processing for alert #${alertId} complete.`);
+            }
 
-            // 4. Publish events to the message queue.
-            publish('alert.created', JSON.stringify({ targetedOfficers, alert: createdAlert }));
-            publish('alert.broadcast', JSON.stringify({ message: 'New alert created' }));
-            res.status(201).json(AlertsService._formatAlert(createdAlert));
-        } catch (error) {
-            console.error('Error creating alert:', error);
-            res.status(500).json({ message: 'Failed to create alert.' });
+        } catch (backgroundError) {
+            console.error(`[Alerts] Critical error during background processing for alert #${preliminaryAlert.id}:`, backgroundError);
         }
     },
 
@@ -177,6 +207,8 @@ const AlertsService = {
         if (newAlert.locationLat && newAlert.locationLng) {
             newAlert.location = { lat: newAlert.locationLat, lng: newAlert.locationLng };
         }
+        delete newAlert.locationLat;
+        delete newAlert.locationLng;
         return newAlert;
     },
 
