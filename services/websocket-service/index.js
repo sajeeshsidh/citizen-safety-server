@@ -1,4 +1,3 @@
-
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { getDb, setupDatabase } = require('../../shared/database');
@@ -54,7 +53,7 @@ const WebSocketService = {
     async broadcastAlerts() {
         const db = getDb();
         const allAlertsRaw = await db.all('SELECT * FROM alerts ORDER BY timestamp DESC');
-        const allAlerts = allAlertsRaw.map(this._formatAlert);
+        const allAlerts = allAlertsRaw.map(alert => this._formatAlert(alert));
 
         console.log(`[WS] Broadcasting alerts to ${wss.clients.size} clients.`);
 
@@ -82,21 +81,26 @@ const WebSocketService = {
             }
         }
     },
-
-    // Helper to parse targetedOfficers from JSON string
+    
     _formatAlert(alert) {
-        if (alert.targetedOfficers) {
+        if (!alert) return null;
+        // Create a shallow copy to avoid mutating objects.
+        const newAlert = { ...alert };
+        if (newAlert.targetedOfficers && typeof newAlert.targetedOfficers === 'string') {
             try {
-                alert.targetedOfficers = JSON.parse(alert.targetedOfficers);
+                newAlert.targetedOfficers = JSON.parse(newAlert.targetedOfficers);
             } catch (e) {
-                console.error("Error in parsing JSON response for targetOfficers", e);
-                alert.targetedOfficers = [];
+                console.error(`[WS] JSON parsing error for targetedOfficers on alert #${newAlert.id}`);
+                newAlert.targetedOfficers = [];
             }
         }
-        if (alert.locationLat && alert.locationLng) {
-            alert.location = { lat: alert.locationLat, lng: alert.locationLng };
+        if (newAlert.locationLat && newAlert.locationLng) {
+            newAlert.location = { lat: newAlert.locationLat, lng: newAlert.locationLng };
         }
-        return alert;
+        // Clean up redundant fields
+        delete newAlert.locationLat;
+        delete newAlert.locationLng;
+        return newAlert;
     }
 };
 

@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
@@ -213,7 +212,7 @@ const AlertsService = {
     },
 
     _formatAlerts(alerts) {
-        return alerts.map(this._formatAlert);
+        return alerts.map(alert => this._formatAlert(alert));
     }
 };
 
