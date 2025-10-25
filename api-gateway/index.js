@@ -30,17 +30,21 @@ app.get('/', (req, res) => {
 
 // --- Proxy Event Handlers ---
 
+// --- Custom Error for Unroutable Requests ---
+const UNROUTABLE_ERROR_MESSAGE = 'UNROUTABLE_REQUEST';
+
 /**
  * Logs when a request is forwarded to a downstream service.
  */
 const onProxyReq = (proxyReq, req) => {
     // req.selectedTarget is attached by our custom router for safe logging
     if (req.selectedTarget) {
-        const fullTargetUrl = new URL(proxyReq.path, req.selectedTarget);
-        console.log(`[Proxy] Forwarding ${req.method} for original URL ${req.originalUrl} to ${fullTargetUrl.href}`);
-    } else {
-        // This fallback should not be reached if the router is configured correctly.
-        console.log(`[Proxy] Forwarding ${req.method} for original URL ${req.originalUrl} to an unknown target`);
+        try {
+            const fullTargetUrl = new URL(proxyReq.path, req.selectedTarget);
+            console.log(`[Proxy] Forwarding ${req.method} for original URL ${req.originalUrl} to ${fullTargetUrl.href}`);
+        } catch (e) {
+            console.error(`[Proxy] Logging error in onProxyReq for path "${proxyReq.path}" and target "${req.selectedTarget}":`, e.message);
+        }
     }
 };
 
@@ -50,11 +54,12 @@ const onProxyReq = (proxyReq, req) => {
 const onProxyRes = (proxyRes, req) => {
     // req.selectedTarget is attached by our custom router for safe logging
     if (req.selectedTarget) {
-        const fullTargetUrl = new URL(proxyRes.req.path, req.selectedTarget);
-        console.log(`[Proxy] Received response with status ${proxyRes.statusCode} from ${fullTargetUrl.href} for ${req.originalUrl}`);
-    } else {
-        // This fallback should not be reached if the router is configured correctly.
-        console.log(`[Proxy] Received response with status ${proxyRes.statusCode} from an unknown target for ${req.originalUrl}`);
+         try {
+            const fullTargetUrl = new URL(proxyRes.req.path, req.selectedTarget);
+            console.log(`[Proxy] Received response with status ${proxyRes.statusCode} from ${fullTargetUrl.href} for ${req.originalUrl}`);
+        } catch (e) {
+            console.error(`[Proxy] Logging error in onProxyRes for path "${proxyRes.req.path}" and target "${req.selectedTarget}":`, e.message);
+        }
     }
 };
 
@@ -62,8 +67,28 @@ const onProxyRes = (proxyRes, req) => {
  * Handles errors from the proxy, such as timeouts or connection failures.
  */
 const onError = (err, req, res, target) => {
-    // Use the target provided by the proxy middleware if available, otherwise use our custom property.
-    const targetHref = target ? target.href : (req.selectedTarget || 'an unknown service');
+    // --- Graceful 404 Handling for Unroutable Requests ---
+    if (err.message === UNROUTABLE_ERROR_MESSAGE) {
+        const errorMessage = `[Proxy] 404 Not Found: No route configured for ${req.method} ${req.originalUrl}`;
+        console.error(errorMessage);
+        if (res && !res.headersSent) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ message: `API route not found for ${req.originalUrl}` }));
+        }
+        return; // Stop further processing for this specific error.
+    }
+
+    // Determine the target URL for logging, safely handling cases where req is undefined.
+    let targetHref = 'an unknown service';
+    // Safely determine the target URL for logging.
+    // The `req` object might not exist for low-level connection errors.
+    if (target && typeof target.href === 'string') {
+        targetHref = target.href;
+    } else if (req && typeof req.selectedTarget === 'string') {
+        targetHref = req.selectedTarget;
+    }
+
+    // Safely log the error.
 
     // Defensive check: req might be undefined for connection errors.
     if (req && req.method && req.originalUrl) {
@@ -110,7 +135,8 @@ const router = (req) => {
             req.selectedTarget = route.target;
         }
     }
-    return null; // Should not happen if routes are configured correctly
+    // If no route matches, throw the custom error to be caught by onError.
+    throw new Error(UNROUTABLE_ERROR_MESSAGE);
 };
 
 // Define path rewrite rules. These are applied to the path seen by the proxy (e.g., '/internal/analyze').
