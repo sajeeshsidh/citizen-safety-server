@@ -33,12 +33,25 @@ const AuthService = {
             console.log(`Auth Service listening on port ${PORT}`);
             // --- Diagnostic Route Logging ---
             console.log('--- Registered Auth Service Routes ---');
-            app._router.stack.forEach((middleware) => {
-                if (middleware.route) { // routes registered directly on the app
-                    const methods = Object.keys(middleware.route.methods).join(', ').toUpperCase();
-                    console.log(`Route registered: ${methods} ${middleware.route.path}`);
+            const listEndpoints = (router, basePath) => {
+              router.stack.forEach((layer) => {
+                if (layer.route) { // Layer is a route handler
+                  const path = layer.route.path;
+                  const methods = Object.keys(layer.route.methods).filter(m => m !== '_all').join(', ').toUpperCase();
+                  if (methods) {
+                    console.log(`Route registered: ${methods} ${basePath}${path === '/' ? '' : path}`);
+                  }
+                } else if (layer.name === 'router') { // Layer is a sub-router
+                  const newBasePath = layer.regexp.source
+                    .replace('^\\', '')
+                    .replace('\\/?(?=\\/|$)', '')
+                    .replace(/\\(.)/g, '$1');
+                  listEndpoints(layer.handle, `${basePath}${newBasePath}`);
                 }
-            });
+              });
+            };
+
+            listEndpoints(app._router, '');
             console.log('------------------------------------');
         });
     },

@@ -55,8 +55,14 @@ const onProxyRes = (proxyRes, req) => {
  */
 const onError = (err, req, res, target) => {
     const targetHref = target ? target.href : 'an unknown service';
-    console.error(`[Proxy] Error for ${req.method} ${req.originalUrl} to ${target}:`, err.message);
-    if (!res.headersSent) {
+    // Defensive check: req might be undefined for connection errors that occur before the request is fully processed.
+    if (req && req.method && req.originalUrl) {
+        console.error(`[Proxy] Error for ${req.method} ${req.originalUrl} to ${targetHref}:`, err.message);
+    } else {
+        console.error(`[Proxy] Error connecting to ${targetHref}:`, err.message);
+    }
+
+    if (res && !res.headersSent) {
         const statusCode = (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') ? 504 : 503;
         const message = statusCode === 504
             ? `Gateway Timeout: The service at ${targetHref} did not respond in time.`
@@ -68,12 +74,6 @@ const onError = (err, req, res, target) => {
     }
 };
 
-/**
- * Creates a configuration object for the http-proxy-middleware.
- * @param {string} target - The base URL of the target service.
- * @param {object|null} pathRewrite - Optional path rewriting rules.
- * @returns {object} The configuration object for the proxy.
- */
 // --- Dynamic Routing Configuration ---
 
 // Define the routing map. Order is important: more specific paths must come first.
@@ -118,7 +118,7 @@ const apiProxy = createProxyMiddleware({
         proxyReq: onProxyReq,
         proxyRes: onProxyRes,
     }
-};
+});
 
 // --- API Gateway Proxy Routing ---
 
