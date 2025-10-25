@@ -19,6 +19,8 @@ app.use(express.json({ limit: '10mb' }));
  * It is a standalone server that communicates with other services over the network.
  */
 const AlertsService = {
+    timeoutProcessorInterval: null,
+
     async initialize() {
         await setupDatabase();
         await connectMessageQueue();
@@ -32,6 +34,41 @@ const AlertsService = {
         app.delete('/alerts/:id', this.deleteAlert);
 
         app.listen(PORT, () => console.log(`Alerts Service listening on port ${PORT}`));
+        
+        // Start the background process to handle alert timeouts.
+        this.timeoutProcessorInterval = setInterval(this.processTimeouts.bind(this), 5000); // Check every 5 seconds
+        console.log('[Alerts] Started background timeout processor.');
+    },
+
+    async processTimeouts() {
+        try {
+            const db = getDb();
+            const now = Date.now();
+            
+            // Find alerts that are still 'new' and have passed their timeout timestamp.
+            const timedOutAlerts = await db.all(
+                'SELECT id FROM alerts WHERE status = ? AND timeoutTimestamp <= ?',
+                ['new', now]
+            );
+
+            if (timedOutAlerts.length > 0) {
+                const ids = timedOutAlerts.map(a => a.id);
+                console.log(`[Alerts] Found ${ids.length} timed-out alerts: ${ids.join(', ')}.`);
+
+                // Create placeholders for the IN clause to update them all at once.
+                const placeholders = ids.map(() => '?').join(',');
+
+                await db.run(
+                    `UPDATE alerts SET status = 'timed_out' WHERE id IN (${placeholders})`,
+                    ids
+                );
+
+                // Notify all clients of the change so their UIs update.
+                publish('alert.broadcast', JSON.stringify({ message: `${ids.length} alerts timed out.` }));
+            }
+        } catch (error) {
+            console.error('[Alerts] Error in timeout processor:', error);
+        }
     },
 
     async getAlerts(req, res) {
