@@ -34,28 +34,38 @@ app.get('/', (req, res) => {
  * Logs when a request is forwarded to a downstream service.
  */
 const onProxyReq = (proxyReq, req) => {
-    // Construct the target from the proxy request object itself, which is more reliable
-    // than trying to access internal properties of the http-proxy agent.
-    const targetUrl = new URL(proxyReq.path, proxyReq.agent.options.target);
-    console.log(`[Proxy] Forwarding ${req.method} for original URL ${req.originalUrl} to ${targetUrl}`);
+    // req.selectedTarget is attached by our custom router for safe logging
+    if (req.selectedTarget) {
+        const fullTargetUrl = new URL(proxyReq.path, req.selectedTarget);
+        console.log(`[Proxy] Forwarding ${req.method} for original URL ${req.originalUrl} to ${fullTargetUrl.href}`);
+    } else {
+        // This fallback should not be reached if the router is configured correctly.
+        console.log(`[Proxy] Forwarding ${req.method} for original URL ${req.originalUrl} to an unknown target`);
+    }
 };
 
 /**
  * Logs when a response is received from a downstream service.
  */
 const onProxyRes = (proxyRes, req) => {
-    // The `proxyRes` is an `http.IncomingMessage`, and its `req` property
-    // is the `http.ClientRequest` (our `proxyReq`). We can use this to get the target.
-    const target = new URL(proxyRes.req.path, `${proxyRes.req.protocol}//${proxyRes.req.host}`);
-    console.log(`[Proxy] Received response with status ${proxyRes.statusCode} from ${target} for ${req.originalUrl}`);
+    // req.selectedTarget is attached by our custom router for safe logging
+    if (req.selectedTarget) {
+        const fullTargetUrl = new URL(proxyRes.req.path, req.selectedTarget);
+        console.log(`[Proxy] Received response with status ${proxyRes.statusCode} from ${fullTargetUrl.href} for ${req.originalUrl}`);
+    } else {
+        // This fallback should not be reached if the router is configured correctly.
+        console.log(`[Proxy] Received response with status ${proxyRes.statusCode} from an unknown target for ${req.originalUrl}`);
+    }
 };
 
 /**
  * Handles errors from the proxy, such as timeouts or connection failures.
  */
 const onError = (err, req, res, target) => {
-    const targetHref = target ? target.href : 'an unknown service';
-    // Defensive check: req might be undefined for connection errors that occur before the request is fully processed.
+    // Use the target provided by the proxy middleware if available, otherwise use our custom property.
+    const targetHref = target ? target.href : (req.selectedTarget || 'an unknown service');
+
+    // Defensive check: req might be undefined for connection errors.
     if (req && req.method && req.originalUrl) {
         console.error(`[Proxy] Error for ${req.method} ${req.originalUrl} to ${targetHref}:`, err.message);
     } else {
@@ -91,12 +101,13 @@ const routeConfig = [
     { path: '/route', target: DIRECTIONS_SERVICE_URL },
 ];
 
-// Router function to select the target based on the request path.
+// Router function to select the target and attach it to the request for logging.
 const router = (req) => {
     for (const route of routeConfig) {
         // req.path is stripped of the '/api' prefix by Express
         if (req.path.startsWith(route.path)) {
-            return route.target;
+            // Attach the selected target to the request object for use in event handlers.
+            req.selectedTarget = route.target;
         }
     }
     return null; // Should not happen if routes are configured correctly
