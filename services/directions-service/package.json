@@ -1,0 +1,15 @@
+{
+  "name": "directions-service",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "@mapbox/polyline": "^1.2.1",
+    "node-fetch": "^2.7.0"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "websocket-service",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.3",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.13.0",
+    "sqlite": "^5.0.1",
+    "sqlite3": "^5.1.6",
+    "ngeohash": "^0.6.3"
+  }
+}
